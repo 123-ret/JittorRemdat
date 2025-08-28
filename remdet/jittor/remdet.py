@@ -59,7 +59,7 @@ T = TypeVar("T")
 # Single-scale training is recommended to
 # be turned on, which can speed up training.
 
-jt.flags.use_cuda = 0 # todo wait to enable
+jt.flags.use_cuda = True # wait to enable done
 cv2.setNumThreads(0)
 
 #due to jittor use nccl by default and computational resources limited so there is no env_settings for disk_config
@@ -178,18 +178,7 @@ save_epoch_intervals = 1
 val_interval_stage2 = 1
 # The maximum checkpoints to keep.
 max_keep_ckpts = 2
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
+param_scheduler = None
 
 
 # In[ ]:
@@ -201,6 +190,104 @@ max_keep_ckpts = 2
 # In[3]:
 
 
+metainfo = dict(classes = classes)
+
+
+# In[ ]:
+
+
+
+
+
+# In[70]:
+
+
+def multi_apply(func, *args, **kwargs):
+    """Apply function to a list of arguments.
+
+    Note:
+        This function applies the ``func`` to multiple inputs and
+        map the multiple outputs of the ``func`` into different
+        list. Each list contains the same type of outputs corresponding
+        to different inputs.
+
+    Args:
+        func (Function): A function that will be applied to a list of
+            arguments
+
+    Returns:
+        tuple(list): A tuple containing multiple list, each list contains \
+            a kind of returned results by the function
+    """
+    pfunc = partial(func, **kwargs) if kwargs else func
+    map_results = map(pfunc, *args)
+    return tuple(map(list, zip(*map_results)))
+def autopad(k, p=None, d=1):  # kernel, padding, dilation
+    """Pad to 'same' shape outputs."""
+    if d > 1:
+        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
+    if p is None:
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
+    return p
+def make_round(x: float, deepen_factor: float = 1.0) -> int:
+    """Make sure that x*deepen_factor becomes an integer not less than 1."""
+    return max(round(x * deepen_factor), 1) if x > 1 else x
+def make_divisible(val, weight):
+    return math.ceil(val * weight / 8) * 8
+def stack_batch(tensor_list: List[jt.Var],
+                pad_size_divisor: int = 1,
+                pad_value: Union[int, float] = 0) -> jt.Var:
+    """Stack multiple tensors to form a batch and pad the tensor to the max
+    shape use the right bottom padding mode in these images. If
+    ``pad_size_divisor > 0``, add padding to ensure the shape of each dim is
+    divisible by ``pad_size_divisor``.
+
+    Args:
+        tensor_list (List[Tensor]): A list of tensors with the same dim.
+        pad_size_divisor (int): If ``pad_size_divisor > 0``, add padding
+            to ensure the shape of each dim is divisible by
+            ``pad_size_divisor``. This depends on the model, and many
+            models need to be divisible by 32. Defaults to 1
+        pad_value (int, float): The padding value. Defaults to 0.
+
+    Returns:
+       Tensor: The n dim tensor.
+    """
+    assert isinstance(
+        tensor_list,
+        list), (f'Expected input type to be list, but got {type(tensor_list)}')
+    assert tensor_list, '`tensor_list` could not be an empty list'
+    assert len({
+        tensor.ndim
+        for tensor in tensor_list
+    }) == 1, (f'Expected the dimensions of all tensors must be the same, '
+              f'but got {[tensor.ndim for tensor in tensor_list]}')
+
+    dim = tensor_list[0].dim()
+    num_img = len(tensor_list)
+    all_sizes: jt.Var = jt.array(
+        [tensor.shape for tensor in tensor_list])
+    max_sizes = jt.ceil(
+        jt.max(all_sizes, dim=0)[0] / pad_size_divisor) * pad_size_divisor
+    padded_sizes = max_sizes - all_sizes
+    # The first dim normally means channel,  which should not be padded.
+    padded_sizes[:, 0] = 0
+    if padded_sizes.sum() == 0:
+        return jt.stack(tensor_list)
+    # `pad` is the second arguments of `F.pad`. If pad is (1, 2, 3, 4),
+    # it means that padding the last dim with 1(left) 2(right), padding the
+    # penultimate dim to 3(top) 4(bottom). The order of `pad` is opposite of
+    # the `padded_sizes`. Therefore, the `padded_sizes` needs to be reversed,
+    # and only odd index of pad should be assigned to keep padding "right" and
+    # "bottom".
+    raise NotImplementedError
+#     pad = jt.zeros(num_img, 2 * dim, dtype=jt.int)
+#     pad[:, 1::2] = padded_sizes[:, range(dim - 1, -1, -1)]
+#     batch_tensor = []
+#     for idx, tensor in enumerate(tensor_list):
+#         batch_tensor.append(
+#             F.pad(tensor, tuple(pad[idx].tolist()), value=pad_value))
+#     return jt.stack(batch_tensor)
 def is_abs(path:str) -> bool:
     if osp.isabs(path) or path.startswith(('http://', 'https://', 's3://')):
         return True
@@ -232,6 +319,60 @@ def list_from_file(filename,
             item_list.append(prefix + line.rstrip('\n\r'))
             cnt += 1
     return item_list
+def yolov5_collate(data_batch: Sequence,
+                   use_ms_training: bool = False) -> dict:
+    """Rewrite collate_fn to get faster training speed.
+
+    Args:
+       data_batch (Sequence): Batch of data.
+       use_ms_training (bool): Whether to use multi-scale training.
+    """
+    batch_imgs = []
+    batch_bboxes_labels = []
+    batch_masks = []
+    batch_keyponits = []
+    batch_keypoints_visible = []
+    for i in range(len(data_batch)):
+        datasamples = data_batch[i]['data_samples']
+        inputs = data_batch[i]['inputs']
+        batch_imgs.append(inputs)
+
+        gt_bboxes = datasamples.gt_instances.bboxes.tensor
+        gt_labels = datasamples.gt_instances.labels
+        if 'masks' in datasamples.gt_instances:
+            masks = datasamples.gt_instances.masks
+            batch_masks.append(masks)
+        if 'gt_panoptic_seg' in datasamples:
+            batch_masks.append(datasamples.gt_panoptic_seg.pan_seg)
+        if 'keypoints' in datasamples.gt_instances:
+            keypoints = datasamples.gt_instances.keypoints
+            keypoints_visible = datasamples.gt_instances.keypoints_visible
+            batch_keyponits.append(keypoints)
+            batch_keypoints_visible.append(keypoints_visible)
+
+        batch_idx = gt_labels.new_full((len(gt_labels), 1), i)
+        bboxes_labels = jt.cat((batch_idx, gt_labels[:, None], gt_bboxes),
+                                  dim=1)
+        batch_bboxes_labels.append(bboxes_labels)
+    collated_results = {
+        'data_samples': {
+            'bboxes_labels': jt.cat(batch_bboxes_labels, 0)
+        }
+    }
+    if len(batch_masks) > 0:
+        collated_results['data_samples']['masks'] = jt.cat(batch_masks, 0)
+
+    if len(batch_keyponits) > 0:
+        collated_results['data_samples']['keypoints'] = jt.cat(
+            batch_keyponits, 0)
+        collated_results['data_samples']['keypoints_visible'] = jt.cat(
+            batch_keypoints_visible, 0)
+
+    if use_ms_training:
+        collated_results['inputs'] = batch_imgs
+    else:
+        collated_results['inputs'] = jt.stack(batch_imgs, 0)
+    return collated_results
 
 
 # In[ ]:
@@ -240,7 +381,7 @@ def list_from_file(filename,
 
 
 
-# In[4]:
+# In[5]:
 
 
 class COCO:
@@ -410,57 +551,12 @@ class COCO:
 
 
 
-# In[5]:
+# In[6]:
 
 
 # ===============================Unmodified in most cases====================
 # The frame used
-# Note:most of them copied from origin but fixed a little to adatapt jittor frame
-# dataloder
-# class Dataloder(Dataset):
-#     def __init__(self, data_root, ann_file, data_prefix,batch_size,num_workers,classes,transform = None):
-#         super().__init__
-# #         self.data_root = data_root
-#         self.img_file = data_root + data_prefix
-#         self.ann_file = data_root + ann_file
-# #         self.data_prefix = data_prefix
-#         self.batch_size = batch_size
-#         self.transform = transform
-#         self.num_workers = num_workers
-#         self.classes = classes
-#         self.cat_classes_id = {v:k for v,k in enumerate(self.classes)}
-#         img_exts = set(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'))
-#         self.imgs = []
-        
-#         with open(self.ann_file, 'r', encoding = 'utf-8') as f:
-#             self.data = json.load(f)
-            
-        
-#     def load_img(self):
-# #         img_file = self.data_root + self.data_prefix
-# #         for root, _dir, imgs in sorted(os.walk(img_file)):
-# #             for img in sorted(imgs):
-# #                 if os.path.splittext(img)[-1].lower() in img_exts:
-# #                     path = os.path.join(img_file,img)
-# #                     sef.imgs[img] = path
-# #         for i,img in self.data['images']:
-# #             self.img['id'] = img['id']
-#         self.imgs = seld.data['images']
-#         self.set_attrs(total_len=len(self.imgs))
-        
-# #     def load_ann(self):
-# #         ann_file = self.data_root + self.ann_file
-# #         with open(ann_file, 'r', encoding = 'utf-8') as f:
-# #             ann = json.load(f)
-# #     def 
-#     def __getitem__(self,k):
-# #         data_prefix = self.data_root + self.
-#         with open(self.img_file + '/' + self.imgs[k]['file_name'], 'rb') as f:
-#             image = Image.open(f).convert('RGB')
-#             if self.transform:
-#                 image = self.transform(image)
-# #             return image, self.ann[]
-#         pass
+# Note:most of them copied from origin but fixed a little to adapt jittor frame
 
 
 class LoadYOLOAnnotations:
@@ -774,7 +870,13 @@ class LoadYOLOAnnotations:
 
 
 
-# In[6]:
+# In[ ]:
+
+
+
+
+
+# In[7]:
 
 
 #Notcie here I decide to make the data in resault to be np.ndarray(some function did not support jt.Var)
@@ -1207,7 +1309,83 @@ def clahe(
 
 
 
-# In[7]:
+# In[8]:
+
+
+class DistributionFocalLoss(nn.Module):
+    r"""Distribution Focal Loss (DFL) is a variant of `Generalized Focal Loss:
+    Learning Qualified and Distributed Bounding Boxes for Dense Object
+    Detection <https://arxiv.org/abs/2006.04388>`_.
+
+    Args:
+        reduction (str): Options are `'none'`, `'mean'` and `'sum'`.
+        loss_weight (float): Loss weight of current loss.
+    """
+
+    def __init__(self, reduction='mean', loss_weight=1.0):
+        super(DistributionFocalLoss, self).__init__()
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def execute(self,
+                pred,
+                target,
+                weight=None,
+                avg_factor=None,
+                reduction_override=None):
+        """Forward function.
+
+        Args:
+            pred (torch.Tensor): Predicted general distribution of bounding
+                boxes (before softmax) with shape (N, n+1), n is the max value
+                of the integral set `{0, ..., n}` in paper.
+            target (torch.Tensor): Target distance label for bounding boxes
+                with shape (N,).
+            weight (torch.Tensor, optional): The weight of loss for each
+                prediction. Defaults to None.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The reduction method used to
+                override the original reduction method of the loss.
+                Defaults to None.
+        """
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+#         loss_cls = self.loss_weight * distribution_focal_loss(
+#             pred, target, weight, reduction=reduction, avg_factor=avg_factor)
+        dis_left = target.long()
+        dis_right = dis_left + 1
+        weight_left = dis_right.float() - label
+        weight_right = target - dis_left.float()
+        loss = cross_entropy(pred, dis_left, reduction='none') * weight_left             + cross_entropy(pred, dis_right, reduction='none') * weight_right
+        if weight is not None:
+            loss = loss * weight
+        if avg_factor is not None:
+                # if reduction is mean, then average the loss by avg_factor
+            if reduction == 'mean':
+                # Avoid causing ZeroDivisionError when avg_factor is 0.0,
+                # i.e., all labels of an image belong to ignore index.
+                eps = jt.finfo(jt.float32).eps
+                loss = loss.sum() / (avg_factor + eps)
+            # if reduction is 'none', then do nothing, otherwise raise an error
+            elif reduction != 'none':
+                raise ValueError('avg_factor can not be used with reduction="sum"')
+        else:
+            if reduction == 'mean':
+                loss.mean()
+            elif reduction == 'sum':
+                loss.sum()
+        return loss
+
+
+# In[ ]:
+
+
+
+
+
+# In[9]:
 
 
 def _pillow2array(img,
@@ -1273,9 +1451,41 @@ def _pillow2array(img,
 
 
 
-# In[8]:
+# In[10]:
 
 
+def is_seq_of(seq: Any,
+              expected_type: Union[Type, tuple],
+              seq_type: Optional[Type] = None) -> bool:
+    """Check whether it is a sequence of some type.
+
+    Args:
+        seq (Sequence): The sequence to be checked.
+        expected_type (type or tuple): Expected type of sequence items.
+        seq_type (type, optional): Expected sequence type. Defaults to None.
+
+    Returns:
+        bool: Return True if ``seq`` is valid else False.
+
+    Examples:
+        >>> from mmengine.utils import is_seq_of
+        >>> seq = ['a', 'b', 'c']
+        >>> is_seq_of(seq, str)
+        True
+        >>> is_seq_of(seq, int)
+        False
+    """
+    if seq_type is None:
+        exp_seq_type = abc.Sequence
+    else:
+        assert isinstance(seq_type, type)
+        exp_seq_type = seq_type
+    if not isinstance(seq, exp_seq_type):
+        return False
+    for item in seq:
+        if not isinstance(item, expected_type):
+            return False
+    return True
 def imfrombytes(content: bytes,
                 flag: str = 'color',
                 channel_order: str = 'bgr',
@@ -1337,7 +1547,7 @@ def imfrombytes(content: bytes,
         return img
 
 
-# In[9]:
+# In[11]:
 
 
 def to_tensor(img:np.ndarray):
@@ -1356,9 +1566,29 @@ def get_shape(data: Dict[str, Any]):
         else:
             raise RuntimeError(f"Unsupported image type: {type(img)}")
     raise ValueError("No image or volume found in data", data.keys())
+def samplelist_boxtype2tensor(batch_data_samples):
+    for data_samples in batch_data_samples:
+        if 'gt_instances' in data_samples:
+            bboxes = data_samples.gt_instances.get('bboxes', None)
+            if bboxes is not None:
+                data_samples.gt_instances.bboxes = to_tensor(bboxes)
+        if 'pred_instances' in data_samples:
+            bboxes = data_samples.pred_instances.get('bboxes', None)
+            if bboxes is not None:
+                data_samples.pred_instances.bboxes = to_tensor(bboxes)
+        if 'ignored_instances' in data_samples:
+            bboxes = data_samples.ignored_instances.get('bboxes', None)
+            if bboxes is not None:
+                data_samples.ignored_instances.bboxes = to_tensor(bboxes)
 
 
-# In[10]:
+# In[ ]:
+
+
+
+
+
+# In[12]:
 
 
 class LoadImageFromFile:
@@ -1492,7 +1722,7 @@ class LoadImageFromFile:
 
 
 
-# In[11]:
+# In[13]:
 
 
 class BaseDataElement:
@@ -2053,7 +2283,7 @@ class BaseDataElement:
                 new_data.set_data(data)
         return new_data
 
-    def to_tensor(self) -> 'BaseDataElement':
+    def to_tensor(self) -> 'BaseDataElement' :
         """Convert all np.ndarray to tensor in data."""
         new_data = self.new()
         for k, v in self.items():
@@ -2134,7 +2364,479 @@ class BaseDataElement:
 
 
 
-# In[12]:
+# In[98]:
+
+
+def yolo_bbox_overlaps(pred: jt.Var,
+                  target: jt.Var,
+                  iou_mode: str = 'ciou',
+                  bbox_format: str = 'xywh',
+                  siou_theta: float = 4.0,
+                  eps: float = 1e-7) -> jt.Var:
+    r"""Calculate overlap between two set of bboxes.
+    `Implementation of paper `Enhancing Geometric Factors into
+    Model Learning and Inference for Object Detection and Instance
+    Segmentation <https://arxiv.org/abs/2005.03572>`_.
+
+    In the CIoU implementation of YOLOv5 and MMDetection, there is a slight
+    difference in the way the alpha parameter is computed.
+
+    mmdet version:
+        alpha = (ious > 0.5).float() * v / (1 - ious + v)
+    YOLOv5 version:
+        alpha = v / (v - ious + (1 + eps)
+
+    Args:
+        pred (Tensor): Predicted bboxes of format (x1, y1, x2, y2)
+            or (x, y, w, h),shape (n, 4).
+        target (Tensor): Corresponding gt bboxes, shape (n, 4).
+        iou_mode (str): Options are ('iou', 'ciou', 'giou', 'siou').
+            Defaults to "ciou".
+        bbox_format (str): Options are "xywh" and "xyxy".
+            Defaults to "xywh".
+        siou_theta (float): siou_theta for SIoU when calculate shape cost.
+            Defaults to 4.0.
+        eps (float): Eps to avoid log(0).
+
+    Returns:
+        Tensor: shape (n, ).
+    """
+    assert iou_mode in ('iou', 'ciou')
+    assert bbox_format in ('xyxy', 'xywh')
+    if bbox_format == 'xywh':
+        raise NotImplementedError
+#         pred = HorizontalBoxes.cxcywh_to_xyxy(pred)
+#         target = HorizontalBoxes.cxcywh_to_xyxy(target)
+
+    bbox1_x1, bbox1_y1 = pred[..., 0], pred[..., 1]
+    bbox1_x2, bbox1_y2 = pred[..., 2], pred[..., 3]
+    bbox2_x1, bbox2_y1 = target[..., 0], target[..., 1]
+    bbox2_x2, bbox2_y2 = target[..., 2], target[..., 3]
+
+    # Overlap
+    overlap = (jt.min(bbox1_x2, bbox2_x2) -
+               jt.max(bbox1_x1, bbox2_x1)).clamp(0) * \
+              (jt.min(bbox1_y2, bbox2_y2) -
+               jt.max(bbox1_y1, bbox2_y1)).clamp(0)
+
+    # Union
+    w1, h1 = bbox1_x2 - bbox1_x1, bbox1_y2 - bbox1_y1
+    w2, h2 = bbox2_x2 - bbox2_x1, bbox2_y2 - bbox2_y1
+    union = (w1 * h1) + (w2 * h2) - overlap + eps
+
+    h1 = bbox1_y2 - bbox1_y1 + eps
+    h2 = bbox2_y2 - bbox2_y1 + eps
+
+    # IoU
+    ious = overlap / union
+
+    # enclose area
+    enclose_x1y1 = jt.min(pred[..., :2], target[..., :2])
+    enclose_x2y2 = jt.max(pred[..., 2:], target[..., 2:])
+    enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min=0)
+
+    enclose_w = enclose_wh[..., 0]  # cw
+    enclose_h = enclose_wh[..., 1]  # ch
+
+    if iou_mode == 'ciou':
+        # CIoU = IoU - ( (ρ^2(b_pred,b_gt) / c^2) + (alpha x v) )
+
+        # calculate enclose area (c^2)
+        enclose_area = enclose_w ** 2 + enclose_h ** 2 + eps
+
+        # calculate ρ^2(b_pred,b_gt):
+        # euclidean distance between b_pred(bbox2) and b_gt(bbox1)
+        # center point, because bbox format is xyxy -> left-top xy and
+        # right-bottom xy, so need to / 4 to get center point.
+        rho2_left_item = ((bbox2_x1 + bbox2_x2) - (bbox1_x1 + bbox1_x2)) ** 2 / 4
+        rho2_right_item = ((bbox2_y1 + bbox2_y2) -
+                           (bbox1_y1 + bbox1_y2)) ** 2 / 4
+        rho2 = rho2_left_item + rho2_right_item  # rho^2 (ρ^2)
+
+        # Width and height ratio (v)
+        wh_ratio = (4 / (math.pi ** 2)) * jt.pow(
+            jt.atan(w2 / h2) - jt.atan(w1 / h1), 2)
+
+        with jt.no_grad():
+            alpha = wh_ratio / (wh_ratio - ious + (1 + eps))
+
+        # CIoU
+        ious = ious - ((rho2 / enclose_area) + (alpha * wh_ratio))
+    else:
+        raise NotImplementedError
+    
+
+    return ious.clamp(min=-1.0, max=1.0)
+
+
+# In[ ]:
+
+
+
+
+
+# In[99]:
+
+
+class YOLO_IoULoss(nn.Module):
+    """IoULoss.
+
+    Computing the IoU loss between a set of predicted bboxes and target bboxes.
+    Args:
+        iou_mode (str): Options are "ciou".
+            Defaults to "ciou".
+        bbox_format (str): Options are "xywh" and "xyxy".
+            Defaults to "xywh".
+        eps (float): Eps to avoid log(0).
+        reduction (str): Options are "none", "mean" and "sum".
+        loss_weight (float): Weight of loss.
+        return_iou (bool): If True, return loss and iou.
+    """
+
+    def __init__(self,
+                 iou_mode: str = 'ciou',
+                 bbox_format: str = 'xywh',
+                 eps: float = 1e-7,
+                 reduction: str = 'mean',
+                 loss_weight: float = 1.0,
+                 return_iou: bool = True):
+        super().__init__()
+        assert bbox_format in ('xywh', 'xyxy')
+        assert iou_mode == 'ciou','not support'
+        self.iou_mode = iou_mode
+        self.bbox_format = bbox_format
+        self.eps = eps
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.return_iou = return_iou
+
+    def execute(
+            self,
+            pred: jt.Var,
+            target: jt.Var,
+            weight: Optional[jt.Var] = None,
+            avg_factor: Optional[float] = None,
+            reduction_override: Optional[Union[str, bool]] = None
+    ) -> Tuple[Union[jt.Var, jt.Var], jt.Var]:
+        """Forward function.
+
+        Args:
+            pred (Tensor): Predicted bboxes of format (x1, y1, x2, y2)
+                or (x, y, w, h),shape (n, 4).
+            target (Tensor): Corresponding gt bboxes, shape (n, 4).
+            weight (Tensor, optional): Element-wise weights.
+            avg_factor (float, optional): Average factor when computing the
+                mean of losses.
+            reduction_override (str, bool, optional): Same as built-in losses
+                of PyTorch. Defaults to None.
+        Returns:
+            loss or tuple(loss, iou):
+        """
+        if weight is not None and not jt.any(weight > 0):
+            if pred.dim() == weight.dim() + 1:
+                weight = weight.unsqueeze(1)
+            return (pred * weight).sum()  # 0
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+
+        if weight is not None and weight.dim() > 1:
+            weight = weight.mean(-1)
+
+        iou = yolo_bbox_overlaps(
+            pred,
+            target,
+            iou_mode=self.iou_mode,
+            bbox_format=self.bbox_format,
+            eps=self.eps)
+#         loss = self.loss_weight * weight_reduce_loss(1.0 - iou, weight,
+#                                                      reduction, avg_factor)
+        loss = 1.0 - iou
+        if weight is not None:
+            loss = loss * weight
+        if avg_factor is not None:
+                # if reduction is mean, then average the loss by avg_factor
+            if reduction == 'mean':
+                # Avoid causing ZeroDivisionError when avg_factor is 0.0,
+                # i.e., all labels of an image belong to ignore index.
+                eps = jt.finfo(jt.float32).eps
+                loss = loss.sum() / (avg_factor + eps)
+            # if reduction is 'none', then do nothing, otherwise raise an error
+            elif reduction != 'none':
+                raise ValueError('avg_factor can not be used with reduction="sum"')
+        else:
+            if reduction == 'mean':
+                loss.mean()
+            elif reduction == 'sum':
+                loss.sum()
+        loss = loss * self.loss_weight
+        if self.return_iou:
+            return loss, iou
+        else:
+            return loss
+
+
+# In[ ]:
+
+
+
+
+
+# In[74]:
+
+
+class YOLOv5DetDataPreprocessor(Module):
+    CastData = Union[Tuple, Dict, BaseDataElement, jt.Var, List, bytes, str,
+                 None]
+    """Rewrite collate_fn to get faster training speed.
+
+    Note: It must be used together with `mmyolo.datasets.utils.yolov5_collate`
+    """
+
+    def __init__(self,
+                 mean: Optional[Sequence[Union[float, int]]] = None,
+                 std: Optional[Sequence[Union[float, int]]] = None,
+                 pad_size_divisor: int = 1,
+                 pad_value: Union[float, int] = 0,
+                 pad_mask: bool = False,
+                 mask_pad_value: int = 0,
+                 pad_seg: bool = False,
+                 seg_pad_value: int = 255,
+                 bgr_to_rgb: bool = False,
+                 rgb_to_bgr: bool = False,
+                 boxtype2tensor: bool = True,
+#                  non_blocking: Optional[bool] = True,
+                 batch_augments: Optional[List[dict]] = None):
+        super().__init__()
+#         self._non_blocking = non_blocking
+# notice:jittor use non_blocking by default
+#         self._device = jt.device('cpu')
+        assert not (bgr_to_rgb and rgb_to_bgr), (
+            '`bgr2rgb` and `rgb2bgr` cannot be set to True at the same time')
+        assert (mean is None) == (std is None), (
+            'mean and std should be both None or tuple')
+        if mean is not None:
+            assert len(mean) == 3 or len(mean) == 1, (
+                '`mean` should have 1 or 3 values, to be compatible with '
+                f'RGB or gray image, but got {len(mean)} values')
+            assert len(std) == 3 or len(std) == 1, (  # type: ignore
+                '`std` should have 1 or 3 values, to be compatible with RGB '  # type: ignore # noqa: E501
+                f'or gray image, but got {len(std)} values')  # type: ignore
+            self._enable_normalize = True
+            self.mean = jt.array(mean)
+            self.std = jt.array(std)
+#             self.register_buffer('mean',
+#                                  jt.Var(mean).view(-1, 1, 1), False)
+#             self.register_buffer('std',
+#                                  jt.Var(std).view(-1, 1, 1), False)
+        else:
+            self._enable_normalize = False
+        self._channel_conversion = rgb_to_bgr or bgr_to_rgb
+        self.pad_size_divisor = pad_size_divisor
+        self.pad_value = pad_value
+        if batch_augments is not None:
+            raise NotImplementedError()
+#             self.batch_augments = nn.ModuleList(
+#                 [MODELS.build(aug) for aug in batch_augments])
+        else:
+            self.batch_augments = None
+        self.pad_mask = pad_mask
+        self.mask_pad_value = mask_pad_value
+        self.pad_seg = pad_seg
+        self.seg_pad_value = seg_pad_value
+        self.boxtype2tensor = boxtype2tensor
+        
+
+    def execute(self, data: dict, training: bool = False) -> dict:
+        """Perform normalization, padding and bgr2rgb conversion based on
+        ``DetDataPreprocessorr``.
+
+        Args:
+            data (dict): Data sampled from dataloader.
+            training (bool): Whether to enable training time augmentation.
+
+        Returns:
+            dict: Data in the same format as the model input.
+        """
+        if not training:
+            batch_pad_shape = self._get_pad_shape(data)
+            data = self.cast_data(data)  # type: ignore
+            _batch_inputs = data['inputs']  # type: ignore
+            # Process data with `pseudo_collate`.
+            if is_seq_of(_batch_inputs,jt.Var):
+                batch_inputs = []
+                for _batch_input in _batch_inputs:
+                    # channel transform
+                    if self._channel_conversion:
+                        _batch_input = _batch_input[[2, 1, 0], ...]  # type: ignore
+                    # Convert to float after channel conversion to ensure
+                    # efficiency
+                    _batch_input = _batch_input.float()  # type: ignore
+                    # Normalization.
+                    if self._enable_normalize:
+                        if self.mean.shape[0] == 3:
+                            assert _batch_input.dim(
+                            ) == 3 and _batch_input.shape[0] == 3, (
+                                'If the mean has 3 values, the input tensor '
+                                'should in shape of (3, H, W), but got the tensor '
+                                f'with shape {_batch_input.shape}')
+                        _batch_input = (_batch_input - self.mean) / self.std
+                    batch_inputs.append(_batch_input)
+                # Pad and stack Tensor.
+                batch_inputs = stack_batch(batch_inputs, self.pad_size_divisor,
+                                           self.pad_value)
+            # Process data with `default_collate`.
+            elif isinstance(_batch_inputs, jt.Var):
+                assert _batch_inputs.dim() == 4, (
+                    'The input of `ImgDataPreprocessor` should be a NCHW tensor '
+                    'or a list of tensor, but got a tensor with shape: '
+                    f'{_batch_inputs.shape}')
+                if self._channel_conversion:
+                    _batch_inputs = _batch_inputs[:, [2, 1, 0], ...]
+                # Convert to float after channel conversion to ensure
+                # efficiency
+                _batch_inputs = _batch_inputs.float()
+                if self._enable_normalize:
+                    _batch_inputs = (_batch_inputs - self.mean) / self.std
+                h, w = _batch_inputs.shape[2:]
+                target_h = math.ceil(
+                    h / self.pad_size_divisor) * self.pad_size_divisor
+                target_w = math.ceil(
+                    w / self.pad_size_divisor) * self.pad_size_divisor
+                pad_h = target_h - h
+                pad_w = target_w - w
+                batch_inputs = nn.pad(_batch_inputs, (0, pad_w, 0, pad_h),
+                                     'constant', self.pad_value)
+            else:
+                raise TypeError('Output of `cast_data` should be a dict of '
+                                'list/tuple with inputs and data_samples, '
+                                f'but got {type(data)}: {data}')  # type: ignore
+            data['inputs'] = batch_inputs  # type: ignore
+            data.setdefault('data_samples', None)  # type: ignore
+            data = data  # type: ignore
+            inputs, data_samples = data['inputs'], data['data_samples']
+
+            if data_samples is not None:
+                # NOTE the batched image size information may be useful, e.g.
+                # in DETR, this is needed for the construction of masks, which is
+                # then used for the transformer_head.
+                batch_input_shape = tuple(inputs[0].size()[-2:])
+                for data_sample, pad_shape in zip(data_samples, batch_pad_shape):
+                    data_sample.set_metainfo({
+                        'batch_input_shape': batch_input_shape,
+                        'pad_shape': pad_shape
+                    })
+
+                if self.boxtype2tensor:
+                    samplelist_boxtype2tensor(data_samples)
+
+                if self.pad_mask and training:
+                    raise NotImplementedError
+#                     self.pad_gt_masks(data_samples)
+
+                if self.pad_seg and training:
+#                     self.pad_gt_sem_seg(data_samples)
+                    raise NotImplementedError
+
+            if training and self.batch_augments is not None:
+                for batch_aug in self.batch_augments:
+                    inputs, data_samples = batch_aug(inputs, data_samples)
+
+            return {'inputs': inputs, 'data_samples': data_samples}
+
+        data = self.cast_data(data)
+        inputs, data_samples = data['inputs'], data['data_samples']
+        assert isinstance(data['data_samples'], dict)
+
+        # TODO: Supports multi-scale training
+        if self._channel_conversion and inputs.shape[1] == 3:
+            inputs = inputs[:, [2, 1, 0], ...]
+        if self._enable_normalize:
+            inputs = (inputs - self.mean) / self.std
+
+        if self.batch_augments is not None:
+            raise NotImplementedError
+#             for batch_aug in self.batch_augments:
+#                 inputs, data_samples = batch_aug(inputs, data_samples)
+
+        img_metas = [{'batch_input_shape': inputs.shape[2:]}] * len(inputs)
+        data_samples_output = {
+            'bboxes_labels': data_samples['bboxes_labels'],
+            'img_metas': img_metas
+        }
+        if 'masks' in data_samples:
+            data_samples_output['masks'] = data_samples['masks']
+        if 'keypoints' in data_samples:
+            data_samples_output['keypoints'] = data_samples['keypoints']
+            data_samples_output['keypoints_visible'] = data_samples[
+                'keypoints_visible']
+
+        return {'inputs': inputs, 'data_samples': data_samples_output}
+    def cast_data(self, data: CastData) -> CastData:
+        """Copying data to the target device.
+
+        Args:
+            data (dict): Data returned by ``DataLoader``.
+
+        Returns:
+            CollatedResult: Inputs and data sample at target device.
+        """
+        if isinstance(data, Mapping):
+            return {key: self.cast_data(data[key]) for key in data}
+        elif isinstance(data, (str, bytes)) or data is None:
+            return data
+        elif isinstance(data, tuple) and hasattr(data, '_fields'):
+            # namedtuple
+            return type(data)(*(self.cast_data(sample) for sample in data))  # type: ignore  # noqa: E501  # yapf:disable
+        elif isinstance(data, Sequence):
+            return type(data)(self.cast_data(sample) for sample in data)  # type: ignore  # noqa: E501  # yapf:disable
+        elif isinstance(data, (jt.Var, BaseDataElement)):
+#             return data.to(self.device, non_blocking=self._non_blocking)
+            return data
+        else:
+            return data
+    def _get_pad_shape(self, data: dict) -> List[tuple]:
+        """Get the pad_shape of each image based on data and
+        pad_size_divisor."""
+        _batch_inputs = data['inputs']
+        # Process data with `pseudo_collate`.
+        if is_seq_of(_batch_inputs, jt.Var):
+            batch_pad_shape = []
+            for ori_input in _batch_inputs:
+                pad_h = int(
+                    np.ceil(ori_input.shape[1] /
+                            self.pad_size_divisor)) * self.pad_size_divisor
+                pad_w = int(
+                    np.ceil(ori_input.shape[2] /
+                            self.pad_size_divisor)) * self.pad_size_divisor
+                batch_pad_shape.append((pad_h, pad_w))
+        # Process data with `default_collate`.
+        elif isinstance(_batch_inputs, jt.Var):
+            assert _batch_inputs.dim() == 4, (
+                'The input of `ImgDataPreprocessor` should be a NCHW tensor '
+                'or a list of tensor, but got a tensor with shape: '
+                f'{_batch_inputs.shape}')
+            pad_h = int(
+                np.ceil(_batch_inputs.shape[2] /
+                        self.pad_size_divisor)) * self.pad_size_divisor
+            pad_w = int(
+                np.ceil(_batch_inputs.shape[3] /
+                        self.pad_size_divisor)) * self.pad_size_divisor
+            batch_pad_shape = [(pad_h, pad_w)] * _batch_inputs.shape[0]
+        else:
+            raise TypeError('Output of `cast_data` should be a dict '
+                            'or a tuple with inputs and data_samples, but got'
+                            f'{type(data)}: {data}')
+        return batch_pad_shape
+
+
+# In[ ]:
+
+
+
+
+
+# In[15]:
 
 
 class InstanceData(BaseDataElement):
@@ -2420,7 +3122,7 @@ class InstanceData(BaseDataElement):
 
 
 
-# In[13]:
+# In[16]:
 
 
 class PixelData(BaseDataElement):
@@ -2549,7 +3251,7 @@ class PixelData(BaseDataElement):
 
 
 
-# In[14]:
+# In[17]:
 
 
 class DetDataSample(BaseDataElement):
@@ -2671,7 +3373,7 @@ class DetDataSample(BaseDataElement):
 
 
 
-# In[15]:
+# In[18]:
 
 
 class PackDetInputs:
@@ -2814,7 +3516,7 @@ class PackDetInputs:
 
 
 
-# In[16]:
+# In[19]:
 
 
 class Base_RandomFlip:
@@ -2986,7 +3688,7 @@ class Base_RandomFlip:
 
 
 
-# In[17]:
+# In[20]:
 
 
 class RandomFlip(Base_RandomFlip):
@@ -3096,7 +3798,7 @@ class RandomFlip(Base_RandomFlip):
 
 
 
-# In[18]:
+# In[21]:
 
 
 class Blur:
@@ -3154,7 +3856,7 @@ class Blur:
 
 
 
-# In[19]:
+# In[22]:
 
 
 class MedianBlur(Blur):
@@ -3185,7 +3887,7 @@ class MedianBlur(Blur):
 
 
 
-# In[20]:
+# In[23]:
 
 
 class ToGray:
@@ -3265,7 +3967,7 @@ class ToGray:
 
 
 
-# In[21]:
+# In[24]:
 
 
 class CLAHE:
@@ -3289,7 +3991,7 @@ class CLAHE:
 
 
 
-# In[22]:
+# In[25]:
 
 
 class BboxParams:
@@ -3448,7 +4150,7 @@ class BboxParams:
 
 
 
-# In[23]:
+# In[26]:
 
 
 class EMA(Module):
@@ -3465,7 +4167,7 @@ class EMA(Module):
         self.module = module.clone().need_grad_(False)
         self.interval = interval
         self.register_buffer('steps',
-                             jt.Var(0))
+                             jt.array(0))
         self.update_buffers = update_buffers
         if update_buffers:
             self.avg_parameters = self.module.state_dict()
@@ -3523,7 +4225,7 @@ class EMA(Module):
 
 
 
-# In[24]:
+# In[27]:
 
 
 class LabelEncoder:
@@ -3673,7 +4375,7 @@ class LabelEncoder:
 
 
 
-# In[25]:
+# In[28]:
 
 
 @dataclass
@@ -3692,7 +4394,7 @@ class LabelMetadata:
 
 
 
-# In[26]:
+# In[29]:
 
 
 class LabelManager:
@@ -3805,7 +4507,7 @@ class LabelManager:
 
 
 
-# In[27]:
+# In[30]:
 
 
 class BboxProcessor:
@@ -4364,7 +5066,7 @@ class BboxProcessor:
 
 
 
-# In[28]:
+# In[31]:
 
 
 class Compose:
@@ -4628,7 +5330,7 @@ class Compose:
         return data
 
 
-# In[29]:
+# In[32]:
 
 
 #support albumentations class
@@ -4645,7 +5347,7 @@ albumentations = {'blur':Blur,
 } 
 
 
-# In[30]:
+# In[33]:
 
 
 class YOLOv5CocoDataset(Dataset):
@@ -4715,7 +5417,27 @@ class YOLOv5CocoDataset(Dataset):
                  pipeline: List[Union[dict, Callable]] = [],
                  test_mode: bool = False,
                  lazy_init: bool = False,
-                 max_refetch: int = 1000):
+                 max_refetch: int = 1000,
+                 batch_size: int = 1,
+                 num_workers: int = 0,
+                 persistent_workers:bool = False,
+                 collate_fn : Callable = None,
+                 shuffle:bool = False,
+                 drop_last = False,
+                 buffer_size = 512*1024*1024,
+                 stop_grad = True,
+                 keep_numpy_array = False
+                ):
+        super().__init__(
+            drop_last,
+            buffer_size,
+            stop_grad,
+            shuffle,
+            collate_fn,
+            num_workers,
+            batch_size,
+            persistent_workers
+        )
         msg = 'due to my energy is limited some function not supported'
         assert batch_shapes_cfg is None, msg
         self.batch_shapes_cfg = batch_shapes_cfg
@@ -5145,7 +5867,7 @@ class YOLOv5CocoDataset(Dataset):
 
 
 
-# In[31]:
+# In[34]:
 
 
 class Albu:
@@ -5415,7 +6137,7 @@ class Albu:
 
 
 
-# In[32]:
+# In[35]:
 
 
 class LetterResize:
@@ -5655,7 +6377,7 @@ class LetterResize:
 
 
 
-# In[33]:
+# In[36]:
 
 
 class YOLOv5KeepRatioResize:  
@@ -5863,7 +6585,7 @@ class YOLOv5KeepRatioResize:
 
 
 
-# In[34]:
+# In[37]:
 
 
 class YOLOv5HSVRandomAug:
@@ -5930,7 +6652,7 @@ class YOLOv5HSVRandomAug:
 
 
 
-# In[35]:
+# In[38]:
 
 
 class YOLOv5RandomAffine:
@@ -6134,7 +6856,7 @@ class YOLOv5RandomAffine:
 
 
 
-# In[36]:
+# In[39]:
 
 
 class YOLO_Mosaic:
@@ -6579,7 +7301,7 @@ class YOLO_Mosaic:
 
 
 
-# In[37]:
+# In[40]:
 
 
 class YOLOv5MixUp:
@@ -6725,118 +7447,33 @@ class YOLOv5MixUp:
         return results
 
 
-# In[38]:
+# In[41]:
 
 
 # DataPrecessor only neccessary(used)
-class YOLOv5DetDataPreprocessor(Module):
-    def __init__(self, data_root, file, prefix):
-        Dataloder(root = data_root + file,
-                   transform = transform.ImageNormalize(mean=[0., 0., 0.],
-                                                       std=[255., 255., 255.]))
-        #bgr2rgb has been write during dataload
+# class YOLOv5DetDataPreprocessor(Module):
+#     def __init__(self, data_root, file, prefix):
+#         Dataloder(root = data_root + file,
+#                    transform = transform.ImageNormalize(mean=[0., 0., 0.],
+#                                                        std=[255., 255., 255.]))
+        #bgr2rgb has been write during dataload, no need
 
 
-# In[39]:
+# In[42]:
 
 
 #module
-class detector(Module):
-    def __init__(self):
-        super(detector, self).__init__()
-        pass
-#     def data_preprocessor(self,input):
-#         mean=[0., 0., 0.]
-#         std=[255., 255., 255.]
-#         bgr_to_rgb=True
-#         return 
-    def excute(self):
-        pass
+# class detector(Module):
+#     def __init__(self):
+#         super(detector, self).__init__()
+#         pass
+#     def excute(self):
+#         pass
         
     
-# model = dict(
-#     type='YOLODetector',
-#     data_preprocessor=dict(
-#         type='YOLOv5DetDataPreprocessor',
-#         mean=[0., 0., 0.],
-#         std=[255., 255., 255.],
-#         bgr_to_rgb=True),
-#     backbone=dict(
-#         type='RemNet',
-#         arch='P5',
-#         last_stage_out_channels=last_stage_out_channels,
-#         deepen_factor=deepen_factor,
-#         widen_factor=widen_factor,
-#         norm_cfg=norm_cfg,
-#         act_cfg=dict(type='SiLU', inplace=True)),
-#     neck=dict(
-#         type='RemDetPAFPN', # YOLOv8PAFPN  RemDetPAFPN
-#         deepen_factor=deepen_factor,
-#         widen_factor=widen_factor,
-#         in_channels=[256, 512, last_stage_out_channels],
-#         out_channels=[256, 512, last_stage_out_channels],
-#         num_csp_blocks=3,
-#         norm_cfg=norm_cfg,
-#         act_cfg=dict(type='SiLU', inplace=True)),
-#     bbox_head=dict(
-#         type='YOLOv8Head',
-#         head_module=dict(
-#             type='YOLOv8HeadModule',
-#             num_classes=num_classes,
-#             in_channels=[256, 512, last_stage_out_channels],
-#             widen_factor=widen_factor,
-#             reg_max=16,
-#             norm_cfg=norm_cfg,
-#             act_cfg=dict(type='SiLU', inplace=True),
-#             featmap_strides=strides),
-#         prior_generator=dict(
-#             type='mmdet.MlvlPointGenerator', offset=0.5, strides=strides),
-#         bbox_coder=dict(type='YOLODistancePointBBoxCoder'),  # TODO need modify
-#         # scaled based on number of detection layers
-#         loss_cls=dict(
-#             type='mmdet.CrossEntropyLoss',
-#             use_sigmoid=True,
-#             reduction='none',
-#             loss_weight=loss_cls_weight),
-#         loss_bbox=dict(
-#             type='YOLO_IoULoss',
-#             iou_mode='ciou',
-#             bbox_format='xyxy',
-#             reduction='sum',
-#             loss_weight=loss_bbox_weight,
-#             return_iou=False),
-#         loss_dfl=dict(
-#             type='mmdet.DistributionFocalLoss',
-#             reduction='mean',
-#             loss_weight=loss_dfl_weight)),
-#     train_cfg=dict(
-#         assigner=dict(
-#             type='BatchTaskAlignedAssigner',
-#             num_classes=num_classes,
-#             use_ciou=True,
-#             topk=tal_topk,
-#             alpha=tal_alpha,
-#             beta=tal_beta,
-#             eps=1e-9)),
-#     test_cfg=model_test_cfg)
-
-# model = dict(
-#     backbone=dict(
-#         last_stage_out_channels=last_stage_out_channels,
-#         deepen_factor=deepen_factor,
-#         widen_factor=widen_factor),
-#     neck=dict(
-#         deepen_factor=deepen_factor,
-#         widen_factor=widen_factor,
-#         in_channels=[256, 512, last_stage_out_channels],
-#         out_channels=[256, 512, last_stage_out_channels]),
-#     bbox_head=dict(
-#         head_module=dict(
-#             widen_factor=widen_factor,
-#             in_channels=[256, 512, last_stage_out_channels])))
 
 
-# In[40]:
+# In[43]:
 
 
 class SiLU(Module):
@@ -6844,14 +7481,9 @@ class SiLU(Module):
         super().__init__()
     def execute(self, x):
         return x * x.sigmoid()
-# class ReLU(Module):
-#     def __init__(self):
-#         super().__init__()
-#     def execute(self, x):
-#         return jt.maximum(0, x)
 
 
-# In[41]:
+# In[62]:
 
 
 class ConvModule(Module):
@@ -6866,7 +7498,7 @@ class ConvModule(Module):
                  bias: Union[bool, str] = 'auto',
                  conv_cfg: Optional[Dict] = None,
                  norm_cfg: Optional[Dict] = None,
-                 act_cfg: Optional[Dict] = dict(type='ReLU'),
+                 act_cfg: Optional[Dict] = dict(type='ReLU',inplace = True),
                  inplace: bool = True,
                  with_spectral_norm: bool = False,
                  padding_mode: str = 'zeros',
@@ -6891,6 +7523,7 @@ class ConvModule(Module):
 
         self.with_norm = norm_cfg is not None
         self.with_activation = act_cfg is not None
+        self.norm_name = None
         # if the conv layer is before a norm layer, bias is unnecessary.
         if bias == 'auto':
             bias = not self.with_norm
@@ -6913,8 +7546,17 @@ class ConvModule(Module):
         self.stride = self.conv.stride
         self.padding = padding
         self.dilation = self.conv.dilation
-        self.transposed = self.conv.transposed
-        self.output_padding = self.conv.output_padding
+        self.transposed = nn.ConvTranspose(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=conv_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias
+        )
+#         self.output_padding = self.conv.output_padding
         self.groups = self.conv.groups
         
         #if jittor support spectral norm,change here TODO
@@ -6944,6 +7586,9 @@ class ConvModule(Module):
             else: self.activate = nn.LeakyReLU()
         # Use msra init by default
         self.init_weights()
+    @property
+    def norm(self):
+        return self.norm_name
     def init_weights(self):
         # 1. It is mainly for customized conv layers with their own
         #    initialization manners by calling their own ``init_weights()``,
@@ -6961,10 +7606,14 @@ class ConvModule(Module):
             else:
                 nonlinearity = 'relu'
                 a = 0
-            kaiming_norm_(self.conv, a=a, nonlinearity=nonlinearity)
+            for para in self.conv.parameters():
+                init.kaiming_normal_(para, a=a, nonlinearity=nonlinearity)
             # Notcie that I do not search in mmengine for defination for kaiming_init : TODO
         if self.with_norm:
-            constant_(self.norm, 1, bias=0)
+            if hasattr(self.norm, 'weight') and module.weight is not None:
+                nn.init.constant_(module.weight, val)
+            if hasattr(self.norm, 'bias') and module.bias is not None:
+                nn.init.constant_(module.bias, bias)
     def execute(self, x):
         layer_index = 0
         while layer_index < len(self.order):
@@ -6993,6 +7642,9 @@ class ConvModule(Module):
             elif layer == 'act' and self.with_activation:
                 x = self.activate(x)
             layer_index += 1
+#         if 'inplace' in act_config:
+#             if act_config['inplace'] = True:
+#                 x.assign(x)
         return x
 
 
@@ -7002,7 +7654,7 @@ class ConvModule(Module):
 
 
 
-# In[42]:
+# In[45]:
 
 
 class SPPFBottleneck(Module):
@@ -7101,7 +7753,7 @@ class SPPFBottleneck(Module):
 
 
 
-# In[43]:
+# In[46]:
 
 
 # Notice : only support RemDet
@@ -7322,7 +7974,7 @@ class RepDWConv(Module):
 
 
 
-# In[44]:
+# In[87]:
 
 
 class DarknetBottleneck(Module):
@@ -7350,12 +8002,19 @@ class DarknetBottleneck(Module):
             Defaults to dict(type='Swish').
     """
 
+#     expansion=0.25,
+#                 kernel_size=(3, 3),
+#                 padding=(1, 1),
+
+    
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
                  expansion: float = 0.5,
                  add_identity: bool = True,
                  use_depthwise: bool = False,
+                 padding = 0,
+                 kernel_size = None,
                  conv_cfg= None,
                  norm_cfg= dict(
                      type='BN', momentum=0.03, eps=0.001),
@@ -7364,18 +8023,19 @@ class DarknetBottleneck(Module):
         super().__init__()
         hidden_channels = int(out_channels * expansion)
         assert not use_depthwise,'not support'
-        conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+        conv = ConvModule
         self.conv1 = ConvModule(
             in_channels,
             hidden_channels,
-            1,
+            kernel_size = 3,
+            padding = 1,
             conv_cfg=conv_cfg,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg)
         self.conv2 = conv(
             hidden_channels,
             out_channels,
-            3,
+            kernel_size = 3,
             stride=1,
             padding=1,
             conv_cfg=conv_cfg,
@@ -7401,7 +8061,7 @@ class DarknetBottleneck(Module):
 
 
 
-# In[45]:
+# In[81]:
 
 
 class ChannelC2f(Module):
@@ -7435,7 +8095,7 @@ class ChannelC2f(Module):
             norm_cfg=norm_cfg,
             act_cfg=act_cfg)
         self.m = nn.ModuleList(
-            DarknetBottleneck(
+            [DarknetBottleneck(
                 self.c,
                 self.c,
                 expansion=0.25,
@@ -7445,7 +8105,7 @@ class ChannelC2f(Module):
                 use_depthwise=False,
                 conv_cfg=conv_cfg,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg) for _ in range(n))
+                act_cfg=act_cfg) for _ in range(n)])
 
     def execute(self, x: jt.Var) -> jt.Var:
         y = list(self.cv1(x).split((self.c, self.c), 1))
@@ -7459,7 +8119,7 @@ class ChannelC2f(Module):
 
 
 
-# In[46]:
+# In[68]:
 
 
 class GatedFFN(Module):  # 0608
@@ -7482,8 +8142,8 @@ class GatedFFN(Module):  # 0608
                                act_cfg=act_cfg)
         self.rep = RepDWConv(self.c, self.c)  # deploy=True
         self.m = nn.ModuleList(
-            ConvModule(self.c, self.c, kernel_size=3, stride=1, padding=autopad(3), groups=self.c,
-                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=None) for _ in range(n - 1)
+           [ ConvModule(self.c, self.c, kernel_size=3, stride=1, padding=autopad(3), groups=self.c,
+                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=None) for _ in range(n - 1)]
         )
         self.act = nn.GELU()
         self.cv2 = ConvModule(self.c, c2,
@@ -7511,7 +8171,7 @@ class GatedFFN(Module):  # 0608
 
 
 
-# In[47]:
+# In[50]:
 
 
 class CED(Module):
@@ -7554,7 +8214,7 @@ class CED(Module):
 
 
 
-# In[48]:
+# In[77]:
 
 
 class RemDetPAFPN(Module):
@@ -7584,6 +8244,7 @@ class RemDetPAFPN(Module):
                  widen_factor: float = 1.0,
                  num_csp_blocks: int = 3,
                  freeze_all: bool = False,
+                 upsample_feats_cat_first: bool = True,
                  norm_cfg = dict(
                      type='BN', momentum=0.03, eps=0.001),
                  act_cfg = dict(type='SiLU', inplace=True),
@@ -7597,6 +8258,7 @@ class RemDetPAFPN(Module):
         self.freeze_all = freeze_all
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
+        self.num_csp_blocks = num_csp_blocks
 
         self.reduce_layers = nn.ModuleList()
         for idx in range(len(in_channels)):
@@ -7757,7 +8419,7 @@ class RemDetPAFPN(Module):
 
 
 
-# In[49]:
+# In[52]:
 
 
 class RemNet(Module):
@@ -7790,6 +8452,7 @@ class RemNet(Module):
                  init_cfg = None):
         self.arch_settings[arch][-1][1] = last_stage_out_channels
         self.channel_expansion_ratio = channel_expansion_ratio
+        arch_setting = self.arch_settings[arch]
         super().__init__()
         self.num_stages = len(arch_setting)
         self.arch_setting = arch_setting
@@ -7828,7 +8491,8 @@ class RemNet(Module):
         """Build a stem layer."""
         return ConvModule(
             self.input_channels,
-            make_divisible(self.arch_setting[0][0], self.widen_factor),
+#             make_divisible(self.arch_setting[0][0], self.widen_factor),
+            math.ceil(self.arch_setting[0][0] * self.widen_factor / 8) * 8,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -7932,7 +8596,555 @@ class RemNet(Module):
 
 
 
-# In[50]:
+# In[102]:
+
+
+class MlvlPointGenerator:
+    pass
+#todo
+
+
+# In[ ]:
+
+
+
+
+
+# In[104]:
+
+
+class YOLODistancePointBBoxCoder:
+    pass
+#todo
+
+
+# In[ ]:
+
+
+
+
+
+# In[108]:
+
+
+class CrossEntropyLoss(nn.Module):
+    pass
+#todo
+    def __init__(self,
+                 use_sigmoid=False,
+                 use_mask=False,
+                 reduction='mean',
+                 class_weight=None,
+                 ignore_index=None,
+                 loss_weight=1.0,
+                 avg_non_ignore=False):
+        """CrossEntropyLoss.
+
+        Args:
+            use_sigmoid (bool, optional): Whether the prediction uses sigmoid
+                of softmax. Defaults to False.
+            use_mask (bool, optional): Whether to use mask cross entropy loss.
+                Defaults to False.
+            reduction (str, optional): . Defaults to 'mean'.
+                Options are "none", "mean" and "sum".
+            class_weight (list[float], optional): Weight of each class.
+                Defaults to None.
+            ignore_index (int | None): The label index to be ignored.
+                Defaults to None.
+            loss_weight (float, optional): Weight of the loss. Defaults to 1.0.
+            avg_non_ignore (bool): The flag decides to whether the loss is
+                only averaged over non-ignored targets. Default: False.
+        """
+        super(CrossEntropyLoss, self).__init__()
+        assert (use_sigmoid is False) or (use_mask is False)
+        self.use_sigmoid = use_sigmoid
+        self.use_mask = use_mask
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.class_weight = class_weight
+        self.ignore_index = ignore_index
+        self.avg_non_ignore = avg_non_ignore
+        if ((ignore_index is not None) and not self.avg_non_ignore
+                and self.reduction == 'mean'):
+            warnings.warn(
+                'Default ``avg_non_ignore`` is False, if you would like to '
+                'ignore the certain label and average loss over non-ignore '
+                'labels, which is the same with PyTorch official '
+                'cross_entropy, set ``avg_non_ignore=True``.')
+
+        if self.use_sigmoid:
+            self.cls_criterion = binary_cross_entropy
+        elif self.use_mask:
+            self.cls_criterion = mask_cross_entropy
+        else:
+            self.cls_criterion = cross_entropy
+
+    def extra_repr(self):
+        """Extra repr."""
+        s = f'avg_non_ignore={self.avg_non_ignore}'
+        return s
+
+    def execute(self,
+                cls_score,
+                label,
+                weight=None,
+                avg_factor=None,
+                reduction_override=None,
+                ignore_index=None,
+                **kwargs):
+        """Forward function.
+
+        Args:
+            cls_score (torch.Tensor): The prediction.
+            label (torch.Tensor): The learning label of the prediction.
+            weight (torch.Tensor, optional): Sample-wise loss weight.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The method used to reduce the
+                loss. Options are "none", "mean" and "sum".
+            ignore_index (int | None): The label index to be ignored.
+                If not None, it will override the default value. Default: None.
+        Returns:
+            torch.Tensor: The calculated loss.
+        """
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+        if ignore_index is None:
+            ignore_index = self.ignore_index
+
+        if self.class_weight is not None:
+            class_weight = cls_score.new_tensor(
+                self.class_weight, device=cls_score.device)
+        else:
+            class_weight = None
+        loss_cls = self.loss_weight * self.cls_criterion(
+            cls_score,
+            label,
+            weight,
+            class_weight=class_weight,
+            reduction=reduction,
+            avg_factor=avg_factor,
+            ignore_index=ignore_index,
+            avg_non_ignore=self.avg_non_ignore,
+            **kwargs)
+        return loss_cls
+
+
+# In[ ]:
+
+
+
+
+
+# In[107]:
+
+
+class YOLOv8Head(Module):
+    """YOLOv8Head head used in `YOLOv8`.
+
+    Args:
+        head_module(:obj:`ConfigDict` or dict): Base module used for YOLOv8Head
+        prior_generator(dict): Points generator feature maps
+            in 2D points-based detectors.
+        bbox_coder (:obj:`ConfigDict` or dict): Config of bbox coder.
+        loss_cls (:obj:`ConfigDict` or dict): Config of classification loss.
+        loss_bbox (:obj:`ConfigDict` or dict): Config of localization loss.
+        loss_dfl (:obj:`ConfigDict` or dict): Config of Distribution Focal
+            Loss.
+        train_cfg (:obj:`ConfigDict` or dict, optional): Training config of
+            anchor head. Defaults to None.
+        test_cfg (:obj:`ConfigDict` or dict, optional): Testing config of
+            anchor head. Defaults to None.
+        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
+            list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    def __init__(self,
+                 head_module,
+                 prior_generator:MlvlPointGenerator,
+                 bbox_coder: YOLODistancePointBBoxCoder,  # TODO need modify
+                 loss_cls:nn.CrossEntropyLoss,
+                 loss_bbox:YOLO_IoULoss,
+                 loss_dfl:DistributionFocalLoss,
+                 train_cfg = None,
+                 test_cfg = None,
+                 init_cfg = None):
+        msg = 'not support'
+        super().__init__()
+#         assert loss_cls['type'] = 'CrossEntropyLoss',msg
+#         assert loss_bbox['type'] = 'YOLO_IoULoss',msg
+#         assert loss_dfl['type'] = 'DistributionFocalLoss',msg
+        self.head_module =head_module
+        self.num_classes = self.head_module.num_classes
+        self.featmap_strides = self.head_module.featmap_strides
+        self.num_levels = len(self.featmap_strides)
+
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+
+        self.loss_cls: nn.Module = loss_cls
+        self.loss_bbox: nn.Module = loss_bbox
+        self.loss_obj: nn.Module = loss_obj
+
+        self.prior_generator = prior_generator
+        self.bbox_coder = bbox_coder
+        self.num_base_priors = self.prior_generator.num_base_priors[0]
+
+        self.featmap_sizes = [jt.empty(1)] * self.num_levels
+
+        self.prior_match_thr = prior_match_thr
+        self.near_neighbor_thr = near_neighbor_thr
+        self.obj_level_weights = obj_level_weights
+        self.ignore_iof_thr = ignore_iof_thr
+
+        self.special_init()
+#         self.loss_dfl = MODELS.build(loss_dfl)
+        # YOLOv8 doesn't need loss_obj
+        self.loss_obj = None
+        
+        self.featmap_sizes_train = None
+        self.num_level_priors = None
+        self.flatten_priors_train = None
+        self.stride_tensor = None
+
+    def special_init(self):
+        """Since YOLO series algorithms will inherit from YOLOv5Head, but
+        different algorithms have special initialization process.
+
+        The special_init function is designed to deal with this situation.
+        """
+#         if self.train_cfg:
+#             self.assigner = TASK_UTILS.build(self.train_cfg.assigner)
+
+#             # Add common attributes to reduce calculation
+#             self.featmap_sizes_train = None
+#             self.num_level_priors = None
+#             self.flatten_priors_train = None
+#             self.stride_tensor = None
+        pass
+
+    def loss_by_feat(
+            self,
+            cls_scores: Sequence[jt.Var],
+            bbox_preds: Sequence[jt.Var],
+            bbox_dist_preds: Sequence[jt.Var],
+            batch_gt_instances: Sequence[Any],
+            batch_img_metas: Sequence[dict],
+            batch_gt_instances_ignore= None) -> dict:
+        """Calculate the loss based on the features extracted by the detection
+        head.
+
+        Args:
+            cls_scores (Sequence[jt.Var]): Box scores for each scale level,
+                each is a 4D-tensor, the channel number is
+                num_priors * num_classes.
+            bbox_preds (Sequence[jt.Var]): Box energies / deltas for each scale
+                level, each is a 4D-tensor, the channel number is
+                num_priors * 4.
+            bbox_dist_preds (Sequence[jt.Var]): Box distribution logits for
+                each scale level with shape (bs, reg_max + 1, H*W, 4).
+            batch_gt_instances (list[:obj:`InstanceData`]): Batch of
+                gt_instance. It usually includes ``bboxes`` and ``labels``
+                attributes.
+            batch_img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            batch_gt_instances_ignore (list[:obj:`InstanceData`], optional):
+                Batch of gt_instances_ignore. It includes ``bboxes`` attribute
+                data that is ignored during training and testing.
+                Defaults to None.
+        Returns:
+            dict[str, jt.Var]: A dictionary of losses.
+        """
+        num_imgs = len(batch_img_metas)
+
+        current_featmap_sizes = [
+            cls_score.shape[2:] for cls_score in cls_scores
+        ]
+        # If the shape does not equal, generate new one
+        if current_featmap_sizes != self.featmap_sizes_train:
+            self.featmap_sizes_train = current_featmap_sizes
+
+            mlvl_priors_with_stride = self.prior_generator.grid_priors( #todo
+                self.featmap_sizes_train,
+                dtype=cls_scores[0].dtype,
+                device=cls_scores[0].device,
+                with_stride=True)
+
+            self.num_level_priors = [len(n) for n in mlvl_priors_with_stride]
+            self.flatten_priors_train = jt.cat(
+                mlvl_priors_with_stride, dim=0)
+            self.stride_tensor = self.flatten_priors_train[..., [2]]
+
+        # gt info
+        gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
+        gt_labels = gt_info[:, :, :1]
+        gt_bboxes = gt_info[:, :, 1:]  # xyxy
+        pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
+
+        # pred info
+        flatten_cls_preds = [
+            cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                 self.num_classes)
+            for cls_pred in cls_scores
+        ]
+        flatten_pred_bboxes = [
+            bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
+            for bbox_pred in bbox_preds
+        ]
+        # (bs, n, 4 * reg_max)
+        flatten_pred_dists = [
+            bbox_pred_org.reshape(num_imgs, -1, self.head_module.reg_max * 4) #todo
+            for bbox_pred_org in bbox_dist_preds
+        ]
+
+        flatten_dist_preds = jt.cat(flatten_pred_dists, dim=1)
+        flatten_cls_preds = jt.cat(flatten_cls_preds, dim=1)
+        flatten_pred_bboxes = jt.cat(flatten_pred_bboxes, dim=1)
+        flatten_pred_bboxes = self.bbox_coder.decode( #todo
+            self.flatten_priors_train[..., :2], flatten_pred_bboxes,
+            self.stride_tensor[..., 0])
+
+        assigned_result = self.assigner(
+            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
+            flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
+            gt_labels, gt_bboxes, pad_bbox_flag)
+
+        assigned_bboxes = assigned_result['assigned_bboxes']
+        assigned_scores = assigned_result['assigned_scores']
+        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+
+        assigned_scores_sum = assigned_scores.sum().clamp(min=1)
+
+        loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
+        loss_cls /= assigned_scores_sum
+
+        # rescale bbox
+        assigned_bboxes /= self.stride_tensor
+        flatten_pred_bboxes /= self.stride_tensor
+
+        # select positive samples mask
+        num_pos = fg_mask_pre_prior.sum()
+        if num_pos > 0:
+            # when num_pos > 0, assigned_scores_sum will >0, so the loss_bbox
+            # will not report an error
+            # iou loss
+            prior_bbox_mask = fg_mask_pre_prior.unsqueeze(-1).repeat([1, 1, 4])
+            pred_bboxes_pos = jt.masked_select(
+                flatten_pred_bboxes, prior_bbox_mask).reshape([-1, 4])
+            assigned_bboxes_pos = jt.masked_select(
+                assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
+            bbox_weight = jt.masked_select(
+                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+            loss_bbox = self.loss_bbox(
+                pred_bboxes_pos, assigned_bboxes_pos,
+                weight=bbox_weight) / assigned_scores_sum
+
+            # dfl loss
+            pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
+            assigned_ltrb = self.bbox_coder.encode( #todo
+                self.flatten_priors_train[..., :2] / self.stride_tensor,
+                assigned_bboxes,
+                max_dis=self.head_module.reg_max - 1,
+                eps=0.01)
+            assigned_ltrb_pos = jt.masked_select(
+                assigned_ltrb, prior_bbox_mask).reshape([-1, 4])
+            loss_dfl = self.loss_dfl(
+                pred_dist_pos.reshape(-1, self.head_module.reg_max),
+                assigned_ltrb_pos.reshape(-1),
+                weight=bbox_weight.expand(-1, 4).reshape(-1),
+                avg_factor=assigned_scores_sum)
+        else:
+            loss_bbox = flatten_pred_bboxes.sum() * 0
+            loss_dfl = flatten_pred_bboxes.sum() * 0
+        _, world_size = get_dist_info()
+        return dict(
+            loss_cls=loss_cls * num_imgs * world_size,
+            loss_bbox=loss_bbox * num_imgs * world_size,
+            loss_dfl=loss_dfl * num_imgs * world_size)
+
+
+# In[ ]:
+
+
+
+
+
+# In[95]:
+
+
+class YOLOv8HeadModule(Module):
+    """YOLOv8HeadModule head module used in `YOLOv8`.
+
+    Args:
+        num_classes (int): Number of categories excluding the background
+            category.
+        in_channels (Union[int, Sequence]): Number of channels in the input
+            feature map.
+        widen_factor (float): Width multiplier, multiply number of
+            channels in each layer by this amount. Defaults to 1.0.
+        num_base_priors (int): The number of priors (points) at a point
+            on the feature grid.
+        featmap_strides (Sequence[int]): Downsample factor of each feature map.
+             Defaults to [8, 16, 32].
+        reg_max (int): Max value of integral set :math: ``{0, ..., reg_max-1}``
+            in QFL setting. Defaults to 16.
+        norm_cfg (:obj:`ConfigDict` or dict): Config dict for normalization
+            layer. Defaults to dict(type='BN', momentum=0.03, eps=0.001).
+        act_cfg (:obj:`ConfigDict` or dict): Config dict for activation layer.
+            Defaults to None.
+        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
+            list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    def __init__(self,
+                 num_classes: int,
+                 in_channels: Union[int, Sequence],
+                 widen_factor: float = 1.0,
+                 num_base_priors: int = 1,
+                 featmap_strides: Sequence[int] = (8, 16, 32),
+                 reg_max: int = 16,
+                 norm_cfg=dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg=dict(type='SiLU', inplace=True),
+                 init_cfg=None):
+        super().__init__()
+        self.init_cfg = init_cfg
+        self.is_init = False
+        self.num_classes = num_classes
+        self.featmap_strides = featmap_strides
+        self.num_levels = len(self.featmap_strides)
+        self.num_base_priors = num_base_priors
+        self.norm_cfg = norm_cfg
+        self.act_cfg = act_cfg
+        self.in_channels = in_channels
+        self.reg_max = reg_max
+
+        in_channels = []
+        for channel in self.in_channels:
+            channel = make_divisible(channel, widen_factor)
+            in_channels.append(channel)
+        self.in_channels = in_channels
+
+        self._init_layers()
+
+    def init_weights(self, prior_prob=0.01):
+        """Initialize the weight and bias of PPYOLOE head."""
+        self.is_init=True
+        for reg_pred, cls_pred, stride in zip(self.reg_preds, self.cls_preds,
+                                              self.featmap_strides):
+            reg_pred[-1].bias.data[:] = 1.0  # box
+            # cls (.01 objects, 80 classes, 640 img)
+            cls_pred[-1].bias.data[:self.num_classes] = math.log(
+                5 / self.num_classes / (640 / stride)**2)
+
+    def _init_layers(self):
+        """initialize conv layers in YOLOv8 head."""
+        # Init decouple head
+        self.cls_preds = nn.ModuleList()
+        self.reg_preds = nn.ModuleList()
+
+        reg_out_channels = max(
+            (16, self.in_channels[0] // 4, self.reg_max * 4))
+        cls_out_channels = max(self.in_channels[0], self.num_classes)
+
+        for i in range(self.num_levels):
+            self.reg_preds.append(
+                nn.Sequential(
+                    ConvModule(
+                        in_channels=self.in_channels[i],
+                        out_channels=reg_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    ConvModule(
+                        in_channels=reg_out_channels,
+                        out_channels=reg_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    nn.Conv2d(
+                        in_channels=reg_out_channels,
+                        out_channels=4 * self.reg_max,
+                        kernel_size=1)))
+            self.cls_preds.append(
+                nn.Sequential(
+                    ConvModule(
+                        in_channels=self.in_channels[i],
+                        out_channels=cls_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    ConvModule(
+                        in_channels=cls_out_channels,
+                        out_channels=cls_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    nn.Conv2d(
+                        in_channels=cls_out_channels,
+                        out_channels=self.num_classes,
+                        kernel_size=1)))
+
+        proj = jt.arange(self.reg_max, dtype=jt.float)
+#         self.register_buffer('proj', proj, persistent=False)
+        self.proj = jt.array(proj)
+
+    def execute(self, x: Tuple[jt.Var]) -> Tuple[List]:
+        """Forward features from the upstream network.
+
+        Args:
+            x (Tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+        Returns:
+            Tuple[List]: A tuple of multi-level classification scores, bbox
+            predictions
+        """
+        assert len(x) == self.num_levels
+        return multi_apply(self.forward_single, x, self.cls_preds,
+                           self.reg_preds)
+
+    def forward_single(self, x: jt.Var, cls_pred: nn.ModuleList,
+                       reg_pred: nn.ModuleList) -> Tuple:
+        """Forward feature of a single scale level."""
+        b, _, h, w = x.shape
+        cls_logit = cls_pred(x)
+        bbox_dist_preds = reg_pred(x)
+        if self.reg_max > 1:
+            bbox_dist_preds = bbox_dist_preds.reshape(
+                [-1, 4, self.reg_max, h * w]).permute(0, 3, 1, 2)
+
+            # TODO: The get_flops script cannot handle the situation of
+            #  matmul, and needs to be fixed later
+            # bbox_preds = bbox_dist_preds.softmax(3).matmul(self.proj)
+            bbox_preds = bbox_dist_preds.softmax(3).matmul(
+                self.proj.view([-1, 1])).squeeze(-1)
+            bbox_preds = bbox_preds.transpose(1, 2).reshape(b, -1, h, w)
+        else:
+            bbox_preds = bbox_dist_preds
+        if self.training:
+            return cls_logit, bbox_preds, bbox_dist_preds
+        else:
+            return cls_logit, bbox_preds
+
+
+# In[ ]:
+
+
+
+
+
+# In[53]:
 
 
 _backend_args = None
@@ -8039,7 +9251,7 @@ last_transform = [Albu(bbox_params=dict(
 
 
 
-# In[51]:
+# In[54]:
 
 
 train_pipeline = ([
@@ -8095,7 +9307,58 @@ train_pipeline = ([
                     'flip_direction',
                 ))
     ])
-test_pipeline = [
+train_pipeline_stage2 = [
+    LoadImageFromFile(backend_args = None),
+    LoadYOLOAnnotations(with_bbox = True),
+    YOLOv5KeepRatioResize(scale=(
+                640,
+                640,
+            )),
+    LetterResize(allow_scale_up=True,
+                pad_val=dict(img=114),
+                scale=(
+                    640,
+                    640,
+                )),
+    YOLOv5RandomAffine(
+                border_val=(
+                    114,
+                    114,
+                    114,
+                ),
+                max_aspect_ratio=100,
+                max_rotate_degree=0.0,
+                max_shear_degree=0.0,
+                scaling_ratio_range=(
+                    0.5,
+                    1.5,
+                )),
+    Albu(bbox_params=dict(
+                    format='pascal_voc',
+                    label_fields=[
+                        'gt_bboxes_labels',
+                        'gt_ignore_flags',
+                    ],
+                    type='BboxParams'),
+                keymap=dict(gt_bboxes='bboxes', img='image'),
+                transforms=[
+                    dict(p=0.01, type='Blur'),
+                    dict(p=0.01, type='MedianBlur'),
+                    dict(p=0.01, type='ToGray'),
+                    dict(p=0.01, type='CLAHE'),
+                ]),
+    YOLOv5HSVRandomAug,
+    RandomFlip(prob=0.5),
+    PackDetInputs(meta_keys=(
+                    'img_id',
+                    'img_path',
+                    'ori_shape',
+                    'img_shape',
+                    'flip',
+                    'flip_direction',
+                ))
+]
+val_pipeline = [
     LoadImageFromFile(backend_args = None),
     YOLOv5KeepRatioResize(scale=(
                 640,
@@ -8125,7 +9388,131 @@ test_pipeline = [
 
 
 
-# In[52]:
+# In[71]:
+
+
+backbone = RemNet(
+    deepen_factor=deepen_factor,
+    widen_factor=widen_factor,
+    act_cfg=dict(inplace=True, type='SiLU'),
+    arch='P5',
+    last_stage_out_channels=1024,
+    norm_cfg=dict(eps=0.001, momentum=0.03, type='BN')
+                 )
+
+
+# In[ ]:
+
+
+
+
+
+# In[75]:
+
+
+data_preprocessor = YOLOv5DetDataPreprocessor(
+    bgr_to_rgb=True,
+    mean=[
+        0.0,
+        0.0,
+        0.0,
+    ],
+    std=[
+        255.0,
+        255.0,
+        255.0,
+    ]
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[97]:
+
+
+head_module = YOLOv8HeadModule(
+    act_cfg=dict(inplace=True, type='SiLU'),
+    norm_cfg=dict(eps=0.001, momentum=0.03, type='BN'),
+    num_classes=3,
+    reg_max=16,
+    widen_factor=widen_factor,
+    featmap_strides=[
+                8,
+                16,
+                32,
+            ],
+            in_channels=[
+                256,
+                512,
+                1024,
+            ],
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[89]:
+
+
+neck = RemDetPAFPN(
+    act_cfg=dict(inplace=True, type='SiLU'),
+    deepen_factor=0.33,
+    in_channels=[
+        256,
+        512,
+        1024,
+    ],
+    norm_cfg=dict(eps=0.001, momentum=0.03, type='BN'),
+    num_csp_blocks=3,
+    out_channels=[
+        256,
+        512,
+        1024,
+    ],
+    widen_factor=0.5
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[109]:
+
+
+loss_bbox = YOLO_IoULoss(
+    bbox_format='xyxy',
+    iou_mode='ciou',
+    loss_weight=7.5,
+    reduction='sum',
+    return_iou=False
+)
+# loss_cls = CrossEntropyLoss(
+    
+# )
+loss_dfl = DistributionFocalLoss(
+    loss_weight=0.375,
+    reduction='mean'
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[90]:
 
 
 class module(Module):
@@ -8144,7 +9531,7 @@ class module(Module):
 
 
 
-# In[53]:
+# In[91]:
 
 
 train_dataset = YOLOv5CocoDataset(
@@ -8152,26 +9539,39 @@ train_dataset = YOLOv5CocoDataset(
     data_prefix = dict(img=train_data_prefix),
     data_root = data_root,
     filter_cfg=dict(filter_empty_gt=False, min_size=32),
-    metainfo=dict(classes=(
-            'car',
-            'truck',
-            'bus',
-        )),
-    pipeline = train_pipeline
-)
+    metainfo=metainfo,
+    pipeline = train_pipeline,
+    batch_size=train_batch_size_per_gpu, 
+    shuffle=True, 
+    num_workers=train_num_workers, 
+    persistent_workers=True, 
+    collate_fn = yolov5_collate)
+train_dataset_stage2 = YOLOv5CocoDataset(
+    ann_file = train_ann_file,
+    data_prefix = dict(img=train_data_prefix),
+    data_root = data_root,
+    filter_cfg=dict(filter_empty_gt=False, min_size=32),
+    metainfo=metainfo,
+    pipeline = train_pipeline_stage2,
+    batch_size=train_batch_size_per_gpu, 
+    shuffle=True, 
+    num_workers=train_num_workers, 
+    persistent_workers=True, 
+    collate_fn = yolov5_collate)
 val_dataset = YOLOv5CocoDataset(
     test_mode=True,
-    pipeline = test_pipeline,
+    pipeline = val_pipeline,
     ann_file=val_ann_file,
-        batch_shapes_cfg=None,
-        data_prefix=dict(img=val_data_prefix),
-        data_root=data_root,
-        metainfo=dict(classes=(
-            'car',
-            'truck',
-            'bus',
-        )),
-)
+    batch_shapes_cfg=None,
+    data_prefix=dict(img=val_data_prefix),
+    data_root=data_root,
+    metainfo=metainfo,
+    batch_size=val_batch_size_per_gpu,
+    num_workers=val_num_workers, 
+    persistent_workers=True, 
+    collate_fn = yolov5_collate, 
+    drop_last=False, 
+    shuffle=False)
 
 
 # In[ ]:
@@ -8180,7 +9580,7 @@ val_dataset = YOLOv5CocoDataset(
 
 
 
-# In[54]:
+# In[92]:
 
 
 if __name__ == '__main__':
