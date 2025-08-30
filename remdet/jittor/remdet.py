@@ -32,6 +32,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 import shutil
 from collections.abc import Mapping
+from collections import OrderedDict
 from dataclasses import dataclass
 from numbers import Real
 import pickle
@@ -40,6 +41,8 @@ import itertools
 import gc
 from contextlib import contextmanager
 from jittor.misc import _pair
+import tempfile
+from pycocotools import mask as maskUtils
 
 T = TypeVar("T")
 
@@ -412,6 +415,87 @@ class COCO:
             self.createIndex()
         self.img_ann_map = self.imgToAnns
         self.cat_img_map = self.catToImgs
+    def loadRes(self, resFile):
+        """
+        Load result file and return a result api object.
+        :param   resFile (str)     : file name of result file
+        :return: res (obj)         : result api object
+        """
+        res = COCO()
+        res.dataset['images'] = [img for img in self.dataset['images']]
+
+        print('Loading and preparing results...')
+        tic = time.time()
+        if type(resFile) == str or (PYTHON_VERSION == 2 and type(resFile) == unicode):
+            anns = json.load(open(resFile))
+        elif type(resFile) == np.ndarray:
+            anns = self.loadNumpyAnnotations(resFile)
+        else:
+            anns = resFile
+        assert type(anns) == list, 'results in not an array of objects'
+        annsImgIds = [ann['image_id'] for ann in anns]
+        assert set(annsImgIds) == (set(annsImgIds) & set(self.getImgIds())),                'Results do not correspond to current coco set'
+        if 'caption' in anns[0]:
+            imgIds = set([img['id'] for img in res.dataset['images']]) & set([ann['image_id'] for ann in anns])
+            res.dataset['images'] = [img for img in res.dataset['images'] if img['id'] in imgIds]
+            for id, ann in enumerate(anns):
+                ann['id'] = id+1
+        elif 'bbox' in anns[0] and not anns[0]['bbox'] == []:
+            res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+            for id, ann in enumerate(anns):
+                bb = ann['bbox']
+                x1, x2, y1, y2 = [bb[0], bb[0]+bb[2], bb[1], bb[1]+bb[3]]
+                if not 'segmentation' in ann:
+                    ann['segmentation'] = [[x1, y1, x1, y2, x2, y2, x2, y1]]
+                ann['area'] = bb[2]*bb[3]
+                ann['id'] = id+1
+                ann['iscrowd'] = 0
+        elif 'segmentation' in anns[0]:
+            res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+            for id, ann in enumerate(anns):
+                # now only support compressed RLE format as segmentation results
+                ann['area'] = maskUtils.area(ann['segmentation'])
+                if not 'bbox' in ann:
+                    ann['bbox'] = maskUtils.toBbox(ann['segmentation'])
+                ann['id'] = id+1
+                ann['iscrowd'] = 0
+        elif 'keypoints' in anns[0]:
+            res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+            for id, ann in enumerate(anns):
+                s = ann['keypoints']
+                x = s[0::3]
+                y = s[1::3]
+                x0,x1,y0,y1 = np.min(x), np.max(x), np.min(y), np.max(y)
+                ann['area'] = (x1-x0)*(y1-y0)
+                ann['id'] = id + 1
+                ann['bbox'] = [x0,y0,x1-x0,y1-y0]
+        print('DONE (t={:0.2f}s)'.format(time.time()- tic))
+
+        res.dataset['annotations'] = anns
+        res.createIndex()
+        return res
+    def loadNumpyAnnotations(self, data):
+        """
+        Convert result data from a numpy array [Nx7] where each row contains {imageID,x1,y1,w,h,score,class}
+        :param  data (numpy.ndarray)
+        :return: annotations (python nested list)
+        """
+        print('Converting ndarray to lists...')
+        assert(type(data) == np.ndarray)
+        print(data.shape)
+        assert(data.shape[1] == 7)
+        N = data.shape[0]
+        ann = []
+        for i in range(N):
+            if i % 1000000 == 0:
+                print('{}/{}'.format(i,N))
+            ann += [{
+                'image_id'  : int(data[i, 0]),
+                'bbox'  : [ data[i, 1], data[i, 2], data[i, 3], data[i, 4] ],
+                'score' : data[i, 5],
+                'category_id': int(data[i, 6]),
+                }]
+        return ann
     def createIndex(self):
         # create index
         print('creating index...')
@@ -1154,6 +1238,35 @@ def imflip(img: np.ndarray, direction: str = 'horizontal') -> np.ndarray:
         return np.flip(img, axis=0)
     else:
         return np.flip(img, axis=(0, 1))
+def bbox_flip(bboxes: jt.Var,
+              img_shape: Tuple[int],
+              direction: str = 'horizontal') -> jt.Var:
+    """Flip bboxes horizontally or vertically.
+
+    Args:
+        bboxes (Tensor): Shape (..., 4*k)
+        img_shape (Tuple[int]): Image shape.
+        direction (str): Flip direction, options are "horizontal", "vertical",
+            "diagonal". Default: "horizontal"
+
+    Returns:
+        Tensor: Flipped bboxes.
+    """
+    assert bboxes.shape[-1] % 4 == 0
+    assert direction in ['horizontal', 'vertical', 'diagonal']
+    flipped = bboxes.clone()
+    if direction == 'horizontal':
+        flipped[..., 0::4] = img_shape[1] - bboxes[..., 2::4]
+        flipped[..., 2::4] = img_shape[1] - bboxes[..., 0::4]
+    elif direction == 'vertical':
+        flipped[..., 1::4] = img_shape[0] - bboxes[..., 3::4]
+        flipped[..., 3::4] = img_shape[0] - bboxes[..., 1::4]
+    else:
+        flipped[..., 0::4] = img_shape[1] - bboxes[..., 2::4]
+        flipped[..., 1::4] = img_shape[0] - bboxes[..., 3::4]
+        flipped[..., 2::4] = img_shape[1] - bboxes[..., 0::4]
+        flipped[..., 3::4] = img_shape[0] - bboxes[..., 1::4]
+    return flipped
 def sample_odd_from_range(random_state, low: int, high: int) -> int:
     """Sample an odd number from the range [low, high] (inclusive).
 
@@ -2482,6 +2595,8 @@ def yolo_bbox_overlaps(pred: jt.Var,
 
         # CIoU
         ious = ious - ((rho2 / enclose_area) + (alpha * wh_ratio))
+    elif iou_mode == 'iou':
+        pass
     else:
         raise NotImplementedError
     
@@ -4729,7 +4844,7 @@ class BboxProcessor:
             dtype=data.dtype,
         )
 
-    def convert_to_albumentations(self, data: np.ndarray, shape: ShapeType) -> np.ndarray:
+    def convert_to_albumentations(self, data: np.ndarray, shape) -> np.ndarray:
         """Convert bounding boxes from the specified format to internal Albumentations format.
 
         Args:
@@ -5078,6 +5193,18 @@ class BboxProcessor:
             data[data_name] = data_array[:, :non_label_columns]
 
         return data
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
 
 
 # In[ ]:
@@ -5449,15 +5576,16 @@ class YOLOv5CocoDataset(Dataset):
                  keep_numpy_array = False
                 ):
         super().__init__(
-            drop_last,
-            buffer_size,
-            stop_grad,
-            shuffle,
-            collate_fn,
-            num_workers,
-            batch_size,
-            persistent_workers
+            drop_last = drop_last,
+            buffer_size = buffer_size,
+            stop_grad = stop_grad,
+            shuffle = shuffle,
+            num_workers = num_workers,
+            batch_size = batch_size
+            # persistent_workers = persistent_workers
         )
+        #jump
+        # print(f'batch_size {self.batch_size}')
         msg = 'due to my energy is limited some function not supported'
         assert batch_shapes_cfg is None, msg
         self.batch_shapes_cfg = batch_shapes_cfg
@@ -5476,6 +5604,7 @@ class YOLOv5CocoDataset(Dataset):
             )
         self.ann_file = ann_file
         self._metainfo = self._load_metainfo(copy.deepcopy(metainfo))
+        # print(self._metainfo)
         self.data_root = data_root
         self.data_prefix = copy.copy(data_prefix)
         self.filter_cfg = copy.deepcopy(filter_cfg)
@@ -5496,6 +5625,7 @@ class YOLOv5CocoDataset(Dataset):
         # Full initialize the dataset.
         if not lazy_init:
             self.full_init()
+#jump
     @property
     def metainfo(self) -> dict:
         """Get meta information of dataset.
@@ -5570,6 +5700,7 @@ class YOLOv5CocoDataset(Dataset):
         if self.ann_file and not is_abs(self.ann_file) and self.data_root:
 #             self.ann_file = join_path(self.data_root, self.ann_file)
             self.ann_file = osp.join(self.data_root, self.ann_file)
+            # print(f'ann_file:{self.ann_file}')
         # Automatically join data directory with `self.root` if path value in
         # `self.data_prefix` is not an absolute path.
         for data_key, prefix in self.data_prefix.items():
@@ -5581,14 +5712,16 @@ class YOLOv5CocoDataset(Dataset):
                 self.data_prefix[data_key] = osp.join(self.data_root, prefix)
             else:
                 self.data_prefix[data_key] = prefix
+            # print(f'data:{self.data_prefix[data_key]}')
     def full_init(self):
         """rewrite full_init() to be compatible with serialize_data in
         BatchShapePolicy."""
         if self._fully_initialized:
+            raise NotImplementedError
             return
         # load data information
         self.data_list = self.load_data_list()
-
+        # print(f'data_list: {self.data_list}')
         # batch_shapes_cfg
 #         if self.batch_shapes_cfg:
 #             batch_shapes_policy = TASK_UTILS.build(self.batch_shapes_cfg)
@@ -5597,6 +5730,7 @@ class YOLOv5CocoDataset(Dataset):
 
         # filter illegal data, such as data that has no annotations.
         self.data_list = self.filter_data()
+        # print(f'new : {self.data_list}')
         # Get subset data according to indices.
 #         if self._indices is not None:
 #             self.data_list = self._get_unserialized_subset(self._indices)
@@ -5604,7 +5738,7 @@ class YOLOv5CocoDataset(Dataset):
         # serialize data_list
         if self.serialize_data:
             self.data_bytes, self.data_address = self._serialize_data()
-
+            # print(f'data_bytes:{self.data_bytes} data_address: {self.data_address}')
         self._fully_initialized = True
     def prepare_data(self, idx: int) -> Any:
         """Pass the dataset to the pipeline during training to support mixed
@@ -5629,6 +5763,7 @@ class YOLOv5CocoDataset(Dataset):
         if not self._fully_initialized:
             self.full_init()
         if self.serialize_data:
+            # print(f'data_address: {self.data_address}')
             return len(self.data_address)
         else:
             return len(self.data_list)
@@ -5810,8 +5945,7 @@ class YOLOv5CocoDataset(Dataset):
             if data is None:
                 idx = self._rand_another()
                 continue
-            return data
-
+            return  collate_fn(data)
         raise Exception(f'Cannot find valid image after {self.max_refetch}! '
                         'Please check your image path and pipeline')
     def filter_data(self) -> List[dict]:
@@ -7467,19 +7601,13 @@ class YOLOv5MixUp:
         return results
 
 
+# In[ ]:
+
+
+
+
+
 # In[43]:
-
-
-# DataPrecessor only neccessary(used)
-# class YOLOv5DetDataPreprocessor(Module):
-#     def __init__(self, data_root, file, prefix):
-#         Dataloder(root = data_root + file,
-#                    transform = transform.ImageNormalize(mean=[0., 0., 0.],
-#                                                        std=[255., 255., 255.]))
-        #bgr2rgb has been write during dataload, no need
-
-
-# In[44]:
 
 
 #module
@@ -7493,7 +7621,7 @@ class YOLOv5MixUp:
     
 
 
-# In[45]:
+# In[44]:
 
 
 class SiLU(Module):
@@ -7503,7 +7631,7 @@ class SiLU(Module):
         return x * x.sigmoid()
 
 
-# In[46]:
+# In[45]:
 
 
 class ConvModule(Module):
@@ -7674,7 +7802,7 @@ class ConvModule(Module):
 
 
 
-# In[47]:
+# In[46]:
 
 
 class SPPFBottleneck(Module):
@@ -7773,7 +7901,7 @@ class SPPFBottleneck(Module):
 
 
 
-# In[48]:
+# In[47]:
 
 
 # Notice : only support RemDet
@@ -7994,7 +8122,7 @@ class RepDWConv(Module):
 
 
 
-# In[49]:
+# In[48]:
 
 
 class DarknetBottleneck(Module):
@@ -8081,7 +8209,7 @@ class DarknetBottleneck(Module):
 
 
 
-# In[50]:
+# In[49]:
 
 
 class ChannelC2f(Module):
@@ -8139,7 +8267,7 @@ class ChannelC2f(Module):
 
 
 
-# In[51]:
+# In[50]:
 
 
 class GatedFFN(Module):  # 0608
@@ -8191,7 +8319,7 @@ class GatedFFN(Module):  # 0608
 
 
 
-# In[52]:
+# In[51]:
 
 
 class CED(Module):
@@ -8234,7 +8362,7 @@ class CED(Module):
 
 
 
-# In[53]:
+# In[52]:
 
 
 class RemDetPAFPN(Module):
@@ -8439,7 +8567,7 @@ class RemDetPAFPN(Module):
 
 
 
-# In[54]:
+# In[53]:
 
 
 class RemNet(Module):
@@ -8616,7 +8744,7 @@ class RemNet(Module):
 
 
 
-# In[55]:
+# In[54]:
 
 
 class MlvlPointGenerator:
@@ -8863,7 +8991,7 @@ class MlvlPointGenerator:
 
 
 
-# In[56]:
+# In[55]:
 
 
 def distance2bbox(
@@ -8932,7 +9060,7 @@ def distance2bbox(
 
 
 
-# In[57]:
+# In[56]:
 
 
 def bbox2distance(points: jt.Var,
@@ -8968,7 +9096,7 @@ def bbox2distance(points: jt.Var,
 
 
 
-# In[58]:
+# In[57]:
 
 
 class YOLODistancePointBBoxCoder:
@@ -9049,7 +9177,7 @@ class YOLODistancePointBBoxCoder:
 
 
 
-# In[59]:
+# In[58]:
 
 
 def binary_cross_entropy(pred,
@@ -9137,7 +9265,7 @@ def binary_cross_entropy(pred,
 
 
 
-# In[60]:
+# In[59]:
 
 
 class CrossEntropyLoss(nn.Module):
@@ -9245,7 +9373,7 @@ class CrossEntropyLoss(nn.Module):
 
 
 
-# In[61]:
+# In[60]:
 
 
 def select_highest_overlaps(pos_mask: jt.Var, overlaps: jt.Var,
@@ -9325,7 +9453,7 @@ def unpack_gt_instances(batch_data_samples) -> tuple:
 
 
 
-# In[62]:
+# In[61]:
 
 
 def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
@@ -9383,7 +9511,7 @@ def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
 
 
 
-# In[63]:
+# In[62]:
 
 
 def nms(boxes: Any,
@@ -9451,7 +9579,7 @@ def nms(boxes: Any,
 
 
 
-# In[64]:
+# In[63]:
 
 
 def batched_nms(boxes: jt.Var,
@@ -9581,7 +9709,7 @@ def batched_nms(boxes: jt.Var,
 
 
 
-# In[65]:
+# In[64]:
 
 
 class YOLOv8Head(Module):
@@ -10106,7 +10234,6 @@ class YOLOv8Head(Module):
             results = results[:cfg.max_per_img]
 
         return results
-#todo
 
 
 # In[ ]:
@@ -10115,7 +10242,7 @@ class YOLOv8Head(Module):
 
 
 
-# In[66]:
+# In[65]:
 
 
 class YOLOv8HeadModule(Module):
@@ -10288,7 +10415,7 @@ class YOLOv8HeadModule(Module):
 
 
 
-# In[67]:
+# In[66]:
 
 
 class BatchTaskAlignedAssigner(nn.Module):
@@ -10599,7 +10726,7 @@ class BatchTaskAlignedAssigner(nn.Module):
 
 
 
-# In[68]:
+# In[67]:
 
 
 class YOLODetector(nn.Module):
@@ -10831,11 +10958,80 @@ class YOLODetector(nn.Module):
 
 
 
-# In[69]:
+# In[68]:
 
 
 class GradScaler:
-    pass
+    def __init__(
+            self,
+            init_scale: float = None,
+            dtype :jt.dtype= jt.float32,
+            growth_factor: float = 2.0,
+            backoff_factor: float = 0.5,
+            growth_interval :int = 2000,
+            min_scale: float = None
+    ):
+        self.dtype = dtype
+        self.finfo = jt.finfo(dtype)
+        if init_scale is None:
+            self.init_scale = self.finfo.max * 0.5
+        else:
+            self.init_scale = init_scale if init_scale < self.finfo.max else self.finfo.max * 0.5
+        if min_scale is None:
+            self.min_scale = self.finfo.min * 100
+        else:
+            self.min_scale = min_scale if min_scale > self.finfo.min else self.finfo.min * 100
+        self.growth_factor = growth_factor
+        self.backoff_factor = backoff_factor
+        self.growth_interval = growth_interval
+        self.scale_factor = jt.array(self.init_scale, dtype = dtype)
+        self.unskipped_step = 0
+        self.overflow = False
+
+    def scale(self, tensor):
+        return tensor * self.scale_factor
+
+    def unscale(self, tensor):
+        for param_groups in optimizer.param_groups:
+            for param in param_groups['params']:
+                if param.grad is not None:
+                    param.grad = param.grad / self.scale_factor
+
+    def check_overflow(self, optimizer):
+        self.overflow = False
+        for param_groups in optimizer.param_groups:
+            for param in param_groups['params']:
+                if param.grad is None:
+                    continue
+                if jt.isinf(param.grad).any() or jt.isnan(param.grad).any():
+                    self.overflow = True
+                    return self.overflow
+        return self.overflow
+
+    def update(self):
+        if self.overflow:
+            self.scale_factor *= self.backoff_factor
+            self.unskipped_step = 0
+        else:
+            self.unskipped_step += 1
+            if self.unskipped_step >= growth_interval:
+                self.scale_factor *= self.growth_factor
+                self.unskipped_step = 0
+            self.scale_factor = jt.clamp(self.scale_factor, self.min_scale)
+
+    def state_dict(self):
+        return{
+            'dtype':self.dtype,
+            'scale_factor':self.scale_factor.item(),
+            'unskipped_step':self.unskipped_step,
+            'overflow':self.overflow
+        }
+
+    def load(self, state_dict:Dict):
+        self.dtype = state_dict['dtype']
+        self.unskipped_step = state_dict['unskipped_factor']
+        self.scale_factor = jt.array(state_dict['scale_factor'], dtype =self.dtype)
+        self.overflow = state_dict['overflow']
 
 
 # In[ ]:
@@ -10844,11 +11040,10 @@ class GradScaler:
 
 
 
-# In[70]:
+# In[69]:
 
 
 class AmpOptimWrapper:
-    pass
     """A subclass of :class:`OptimWrapper` that supports automatic mixed
     precision training based on jt.cuda.amp.
 
@@ -10891,80 +11086,76 @@ class AmpOptimWrapper:
         ``accumulative_counts``.
     """
 
-#     valid_dtypes = ('float16', 'bfloat16', 'float32', 'float64')
+    valid_dtypes = ('float16', 'bfloat16', 'float32', 'float64')
 
-#     def __init__(self,
-#                  loss_scale: str = 'dynamic',
-#                  dtype: Union[str, jt.dtype] = None,
-#                  use_fsdp: bool = False,
-#                  optimizer: jt.optim.Optimizer = None,
-#                  accumulative_counts: int = 1,
-#                  clip_grad: Optional[dict] = None):
-        
-# #         assert digit_version(TORCH_VERSION) >= digit_version('1.6.0'), (
-# #             '`jt.cuda.amp` is only available when pytorch version >= 1.6')
-# #         assert is_cuda_available() or is_npu_available() or is_mlu_available(
-# #         ) or is_musa_available(), (
-# #             '``AmpOptimizerWrapper`` is only available training '
-# #             'on gpu, npu, mlu or musa')
-#         assert jt.is_cuda_available(),(
-#             '``AmpOptimizerWrapper`` is only available training '
-#             'on gpu, npu, mlu or musa')
+    def __init__(self,
+                 loss_scale: str = 'dynamic',
+                 dtype: Union[str, jt.dtype] = None,
+                 use_fsdp: bool = False,
+                 optimizer: jt.optim.Optimizer = None,
+                 accumulative_counts: int = 1,
+                 clip_grad: Optional[dict] = None):
+
+        # assert jt.is_cuda_available(),(
+        #     '``AmpOptimizerWrapper`` is only available training '
+        #     'on gpu, npu, mlu or musa')
+        assert jt.flags.use_cuda ,(
+            '``AmpOptimizerWrapper`` is only available training '
+            'on gpu, npu, mlu or musa')
     
-    
-#         assert accumulative_counts > 0, (
-#             '_accumulative_counts at least greater than or equal to 1')
-#         self._accumulative_counts = accumulative_counts
-#         self.optimizer = optimizer
+        assert accumulative_counts > 0, (
+            '_accumulative_counts at least greater than or equal to 1')
+        self._accumulative_counts = accumulative_counts
+        self.optimizer = optimizer
 
-#         if clip_grad is not None:
-#             # clip_grad_kwargs should not be non-empty dict.
-#             assert isinstance(clip_grad, dict) and clip_grad, (
-#                 'If `clip_grad` is not None, it should be a `dict` '
-#                 'which is the arguments of `jt.nn.utils.clip_grad_norm_` '
-#                 'or clip_grad_value_`.')
-#             clip_type = clip_grad.pop('type', 'norm')
-#             if clip_type == 'norm':
-#                 self.clip_func = jt.nn.utils.clip_grad_norm_
-#                 self.grad_name = 'grad_norm'
-#             elif clip_type == 'value':
-#                 self.clip_func = jt.nn.utils.clip_grad_value_
-#                 self.grad_name = 'grad_value'
-#             else:
-#                 raise ValueError('type of clip_grad should be "norm" or '
-#                                  f'"value" but got {clip_type}')
-#             assert clip_grad, ('`clip_grad` should contain other arguments '
-#                                'besides `type`. The arguments should match '
-#                                'with the `jt.nn.utils.clip_grad_norm_` or '
-#                                'clip_grad_value_`')
-#         self.clip_grad_kwargs = clip_grad
-#         # Used to update `grad_norm` log message.
-# #         self.message_hub = MessageHub.get_current_instance()
-#         self._inner_count = 0
-#         # `_max_counts` means the total number of parameter updates.  It
-#         # ensures that the gradient of the last few iterations will not be
-#         # lost when the `_max_counts` is not divisible by
-#         # `accumulative_counts`.
-#         self._max_counts = -1
-#         # The `_remainder_iter` is used for calculating loss factor at the
-#         # last few iterations. If `_max_counts` has not been initialized,
-#         # the loss factor will always be the same as `_accumulative_counts`.
-#         self._remainder_counts = -1
+        if clip_grad is not None:
+            # clip_grad_kwargs should not be non-empty dict.
+            assert isinstance(clip_grad, dict) and clip_grad, (
+                'If `clip_grad` is not None, it should be a `dict` '
+                'which is the arguments of `jt.nn.utils.clip_grad_norm_` '
+                'or clip_grad_value_`.')
+            clip_type = clip_grad.pop('type', 'norm')
+            if clip_type == 'norm':
+                self.clip_func = optimizer.clip_grad_norm
+                self.grad_name = 'grad_norm'
+            # elif clip_type == 'value':
+            #     self.clip_func = jt.nn.utils.clip_grad_value_
+            #     self.grad_name = 'grad_value'
+            # else:
+            #     raise ValueError('type of clip_grad should be "norm" or '
+            #                      f'"value" but got {clip_type}')
+            assert clip_grad, ('`clip_grad` should contain other arguments '
+                               'besides `type`. The arguments should match '
+                               'with the `jt.nn.utils.clip_grad_norm_` or '
+                               'clip_grad_value_`')
+        self.clip_grad_kwargs = clip_grad
+        # Used to update `grad_norm` log message.
+#         self.message_hub = MessageHub.get_current_instance()
+        self._inner_count = 0
+        # `_max_counts` means the total number of parameter updates.  It
+        # ensures that the gradient of the last few iterations will not be
+        # lost when the `_max_counts` is not divisible by
+        # `accumulative_counts`.
+        self._max_counts = -1
+        # The `_remainder_iter` is used for calculating loss factor at the
+        # last few iterations. If `_max_counts` has not been initialized,
+        # the loss factor will always be the same as `_accumulative_counts`.
+        self._remainder_counts = -1
 
-#         # The Following code is used to initialize `base_param_settings`.
-#         # `base_param_settings` is used to store the parameters that are not
-#         # updated by the optimizer.
-#         # The `base_param_settings` used for tracking the base learning in the
-#         # optimizer. If the optimizer has multiple parameter groups, this
-#         # params will not be scaled by the loss factor.
-#         if len(optimizer.param_groups) > 1:
-#             self.base_param_settings = {
-#                 'params': jt.Var([0.0], dtype=jt.float)
-#             }
-#             self.base_param_settings.update(**self.optimizer.defaults)
-#         else:
-#             self.base_param_settings = None  # type: ignore
-#         self._scale_update_param = None
+        # The Following code is used to initialize `base_param_settings`.
+        # `base_param_settings` is used to store the parameters that are not
+        # updated by the optimizer.
+        # The `base_param_settings` used for tracking the base learning in the
+        # optimizer. If the optimizer has multiple parameter groups, this
+        # params will not be scaled by the loss factor.
+        # if len(optimizer.param_groups) > 1:
+        #     self.base_param_settings = {
+        #         'params': jt.Var([0.0], dtype=jt.float)
+        #     }
+        #     self.base_param_settings.update(**self.optimizer.defaults)
+        # else:
+        self.base_param_settings = None  # type: ignore
+        self._scale_update_param = None
 
 #         if use_fsdp:
 #             raise NotImplementedError
@@ -10976,105 +11167,195 @@ class AmpOptimWrapper:
 # #                 raise RuntimeError(
 # #                     'PyTorch>=2.0.0 is required when sets `use_fsdp=True`')
 #         else:
-#             scaler_type = GradScaler
+        scaler_type = GradScaler
 
-#         if loss_scale == 'dynamic':
-#             #  If loss_scale is a string, it must be 'dynamic', then dynamic
-#             #  loss scaling will be used.
-#             self.loss_scaler = scaler_type()
-#         elif isinstance(loss_scale, float):
-#             # Static loss scaling
-#             self._scale_update_param = loss_scale
-#             self.loss_scaler = scaler_type(init_scale=loss_scale)
-#         elif isinstance(loss_scale, dict):
-#             # More specific configuration.
-#             self.loss_scaler = scaler_type(**loss_scale)
-#         else:
-#             raise TypeError('loss_scale must be of type float, dict, or '
-#                             f'"dynamic", but got {loss_scale}')
+        if loss_scale == 'dynamic':
+            #  If loss_scale is a string, it must be 'dynamic', then dynamic
+            #  loss scaling will be used.
+            self.loss_scaler = scaler_type()
+        else:
+            raise NotImplementedError
+        # elif isinstance(loss_scale, float):
+        #     # Static loss scaling
+        #     self._scale_update_param = loss_scale
+        #     self.loss_scaler = scaler_type(init_scale=loss_scale)
+        # elif isinstance(loss_scale, dict):
+        #     # More specific configuration.
+        #     self.loss_scaler = scaler_type(**loss_scale)
+        # else:
+        #     raise TypeError('loss_scale must be of type float, dict, or '
+        #                     f'"dynamic", but got {loss_scale}')
 
-#         # convert string value to jt.dtype
-#         if isinstance(dtype, str):
-#             assert dtype in self.valid_dtypes, (
-#                 f'dtype should be any of {self.valid_dtypes}, got {dtype}')
-#             dtype = getattr(torch, dtype)
+        # convert string value to jt.dtype
+        if isinstance(dtype, str):
+            assert dtype in self.valid_dtypes, (
+                f'dtype should be any of {self.valid_dtypes}, got {dtype}')
+            dtype = getattr(jt, dtype)
 
-#         assert dtype is None or isinstance(dtype, jt.dtype), (
-#             f'dtype should be None or instance of jt.dtype, got {dtype}')
-#         self.cast_dtype = dtype
+        assert dtype is None or isinstance(dtype, jt.dtype), (
+            f'dtype should be None or instance of jt.dtype, got {dtype}')
+        self.cast_dtype = dtype
 
-#     def backward(self, loss: jt.Var, **kwargs):
-#         """Perform gradient back propagation with :attr:`loss_scaler`.
+    def backward(self, loss: jt.Var, **kwargs):
+        """Perform gradient back propagation with :attr:`loss_scaler`.
 
-#         Args:
-#             loss (jt.Var): The loss of current iteration.
-#             kwargs: Keyword arguments passed to :meth:`jt.Var.backward`
-#         """
-#         self.loss_scaler.scale(loss).backward(**kwargs)
-#         self._inner_count += 1
+        Args:
+            loss (jt.Var): The loss of current iteration.
+            kwargs: Keyword arguments passed to :meth:`jt.Var.backward`
+        """
+        self.loss_scaler.scale(loss).backward(**kwargs)
+        self._inner_count += 1
 
-#     def step(self, **kwargs):
-#         """Update parameters with :attr:`loss_scaler`.
+    def step(self, **kwargs):
+        """Update parameters with :attr:`loss_scaler`.
 
-#         Args:
-#             kwargs: Keyword arguments passed to
-#                 :meth:`jt.optim.Optimizer.step`.
-#         """
-#         if self.clip_grad_kwargs:
-#             self.loss_scaler.unscale_(self.optimizer)
-#             self._clip_grad()
-#         self.loss_scaler.step(self.optimizer, **kwargs)
-#         self.loss_scaler.update(self._scale_update_param)
+        Args:
+            kwargs: Keyword arguments passed to
+                :meth:`jt.optim.Optimizer.step`.
+        """
+        if self.clip_grad_kwargs:
+            self.loss_scaler.unscale(self.optimizer)
+            self._clip_grad()
+        self.loss_scaler.step(self.optimizer, **kwargs)
+        self.loss_scaler.update(self._scale_update_param)
 
-#     def state_dict(self) -> dict:
-#         """Get the state dictionary of :attr:`optimizer` and
-#         :attr:`loss_scaler`.
+    def _clip_grad(self) -> None:
+        """Clip the gradients of parameters."""
+        params: List[torch.Tensor] = []
+        for param_group in self.optimizer.param_groups:
+            params.extend(param_group['params'])
 
-#         Based on the state dictionary of the optimizer, the returned state
-#         dictionary will add a key named "loss_scaler".
+        params = list(
+            filter(lambda p: p.requires_grad and p.grad is not Noneparams))
+        if len(params) > 0:
+            grad = self.clip_func(**self.clip_grad_kwargs)
+            # `torch.nn.utils.clip_grad_value_` will return None.
+            if grad is not None:
+                print(f'train/{self.grad_name}',
+                                               float(grad))
 
-#         Returns:
-#             dict: The merged state dict of :attr:`loss_scaler` and
-#             :attr:`optimizer`.
-#         """
-#         # save state_dict of loss_scaler
-#         state_dict = super().state_dict()
-#         state_dict['loss_scaler'] = self.loss_scaler.state_dict()
-#         return state_dict
+    def state_dict(self) -> dict:
+        """Get the state dictionary of :attr:`optimizer` and
+        :attr:`loss_scaler`.
 
-#     def load_state_dict(self, state_dict: dict):
-#         """Load and parse the state dictionary of :attr:`optimizer` and
-#         :attr:`loss_scaler`.
+        Based on the state dictionary of the optimizer, the returned state
+        dictionary will add a key named "loss_scaler".
 
-#         If state_dict contains "loss_scaler.", the :attr:`loss_scaler` will
-#         load the corresponding keys. Otherwise, only the :attr:`optimizer`
-#         will load the state dictionary.
+        Returns:
+            dict: The merged state dict of :attr:`loss_scaler` and
+            :attr:`optimizer`.
+        """
+        # save state_dict of loss_scaler
+        # state_dict = super().state_dict()
+        state_dict = self.optimizer.state_dict()
+        state_dict['loss_scaler'] = self.loss_scaler.state_dict()
+        return state_dict
 
-#         Args:
-#             state_dict (dict): The state dict of :attr:`optimizer` and
-#                 :attr:`loss_scaler`
-#         """
-#         if 'loss_scaler' in state_dict:
-#             self.loss_scaler.load_state_dict(state_dict.pop('loss_scaler'))
+    def load_state_dict(self, state_dict: dict):
+        """Load and parse the state dictionary of :attr:`optimizer` and
+        :attr:`loss_scaler`.
 
-#         if 'base_param_settings' in state_dict:
-#             self.base_param_settings = state_dict.pop('base_param_settings')
+        If state_dict contains "loss_scaler.", the :attr:`loss_scaler` will
+        load the corresponding keys. Otherwise, only the :attr:`optimizer`
+        will load the state dictionary.
 
-#         # load state_dict of optimizer
-#         self.optimizer.load_state_dict(state_dict)
+        Args:
+            state_dict (dict): The state dict of :attr:`optimizer` and
+                :attr:`loss_scaler`
+        """
+        if 'loss_scaler' in state_dict:
+            self.loss_scaler.load_state_dict(state_dict.pop('loss_scaler'))
 
-#     @contextmanager
-#     def optim_context(self, model: nn.Module):
-#         """Enables the context for mixed precision training, and enables the
-#         context for disabling gradient synchronization during gradient
-#         accumulation context.
+        # if 'base_param_settings' in state_dict:
+        #     self.base_param_settings = state_dict.pop('base_param_settings')
 
-#         Args:
-#             model (nn.Module): The training model.
-#         """
-#         from mmengine.runner.amp import autocast
-#         with super().optim_context(model), autocast(dtype=self.cast_dtype):
-#             yield
+        # load state_dict of optimizer
+        self.optimizer.load_state_dict(state_dict)
+
+    # @contextmanager
+    # def optim_context(self, model: nn.Module):
+    #     """Enables the context for mixed precision training, and enables the
+    #     context for disabling gradient synchronization during gradient
+    #     accumulation context.
+    #
+    #     Args:
+    #         model (nn.Module): The training model.
+    #     """
+    #     from mmengine.runner.amp import autocast
+    #     with super().optim_context(model), autocast(dtype=self.cast_dtype):
+    #         yield
+
+
+# In[ ]:
+
+
+
+
+
+# In[70]:
+
+
+def bbox_overlaps(bboxes1,
+                  bboxes2,
+                  mode='iou',
+                  eps=1e-6,
+                  use_legacy_coordinate=False):
+    """Calculate the ious between each bbox of bboxes1 and bboxes2.
+
+    Args:
+        bboxes1 (ndarray): Shape (n, 4)
+        bboxes2 (ndarray): Shape (k, 4)
+        mode (str): IOU (intersection over union) or IOF (intersection
+            over foreground)
+        use_legacy_coordinate (bool): Whether to use coordinate system in
+            mmdet v1.x. which means width, height should be
+            calculated as 'x2 - x1 + 1` and 'y2 - y1 + 1' respectively.
+            Note when function is used in `VOCDataset`, it should be
+            True to align with the official implementation
+            `http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCdevkit_18-May-2011.tar`
+            Default: False.
+
+    Returns:
+        ious (ndarray): Shape (n, k)
+    """
+
+    assert mode in ['iou', 'iof']
+    if not use_legacy_coordinate:
+        extra_length = 0.
+    else:
+        extra_length = 1.
+    bboxes1 = bboxes1.astype(np.float32)
+    bboxes2 = bboxes2.astype(np.float32)
+    rows = bboxes1.shape[0]
+    cols = bboxes2.shape[0]
+    ious = np.zeros((rows, cols), dtype=np.float32)
+    if rows * cols == 0:
+        return ious
+    exchange = False
+    if bboxes1.shape[0] > bboxes2.shape[0]:
+        bboxes1, bboxes2 = bboxes2, bboxes1
+        ious = np.zeros((cols, rows), dtype=np.float32)
+        exchange = True
+    area1 = (bboxes1[:, 2] - bboxes1[:, 0] + extra_length) * (
+        bboxes1[:, 3] - bboxes1[:, 1] + extra_length)
+    area2 = (bboxes2[:, 2] - bboxes2[:, 0] + extra_length) * (
+        bboxes2[:, 3] - bboxes2[:, 1] + extra_length)
+    for i in range(bboxes1.shape[0]):
+        x_start = np.maximum(bboxes1[i, 0], bboxes2[:, 0])
+        y_start = np.maximum(bboxes1[i, 1], bboxes2[:, 1])
+        x_end = np.minimum(bboxes1[i, 2], bboxes2[:, 2])
+        y_end = np.minimum(bboxes1[i, 3], bboxes2[:, 3])
+        overlap = np.maximum(x_end - x_start + extra_length, 0) * np.maximum(
+            y_end - y_start + extra_length, 0)
+        if mode == 'iou':
+            union = area1[i] + area2 - overlap
+        else:
+            union = area1[i] if not exchange else area2
+        union = np.maximum(union, eps)
+        ious[i, :] = overlap / union
+    if exchange:
+        ious = ious.T
+    return ious
 
 
 # In[ ]:
@@ -11084,6 +11365,1375 @@ class AmpOptimWrapper:
 
 
 # In[71]:
+
+
+class COCOeval:
+    # Interface for evaluating detection on the Microsoft COCO dataset.
+    #
+    # The usage for CocoEval is as follows:
+    #  cocoGt=..., cocoDt=...       # load dataset and results
+    #  E = CocoEval(cocoGt,cocoDt); # initialize CocoEval object
+    #  E.params.recThrs = ...;      # set parameters as desired
+    #  E.evaluate();                # run per image evaluation
+    #  E.accumulate();              # accumulate per image results
+    #  E.summarize();               # display summary metrics of results
+    # For example usage see evalDemo.m and http://mscoco.org/.
+    #
+    # The evaluation parameters are as follows (defaults in brackets):
+    #  img_ids     - [all] N img ids to use for evaluation
+    #  cat_ids     - [all] K cat ids to use for evaluation
+    #  iouThrs    - [.5:.05:.95] T=10 IoU thresholds for evaluation
+    #  recThrs    - [0:.01:1] R=101 recall thresholds for evaluation
+    #  areaRng    - [...] A=4 object area ranges for evaluation
+    #  maxDets    - [1 10 100] M=3 thresholds on max detections per image
+    #  iouType    - ['segm'] set iouType to 'segm', 'bbox' or 'keypoints'
+    #  iouType replaced the now DEPRECATED useSegm parameter.
+    #  useCats    - [1] if true use category labels for evaluation
+    # Note: if useCats=0 category labels are ignored as in proposal scoring.
+    # Note: multiple areaRngs [Ax2] and maxDets [Mx1] can be specified.
+    #
+    # evaluate(): evaluates detections on every image and every category and
+    # concats the results into the "evalImgs" with fields:
+    #  dt_ids      - [1xD] id for each of the D detections (dt)
+    #  gt_ids      - [1xG] id for each of the G ground truths (gt)
+    #  dtMatches  - [TxD] matching gt id at each IoU or 0
+    #  gtMatches  - [TxG] matching dt id at each IoU or 0
+    #  dtScores   - [1xD] confidence of each dt
+    #  gtIgnore   - [1xG] ignore flag for each gt
+    #  dtIgnore   - [TxD] ignore flag for each dt at each IoU
+    #
+    # accumulate(): accumulates the per-image, per-category evaluation
+    # results in "evalImgs" into the dictionary "eval" with fields:
+    #  params     - parameters used for evaluation
+    #  date       - date evaluation was performed
+    #  counts     - [T,R,K,A,M] parameter dimensions (see above)
+    #  precision  - [TxRxKxAxM] precision for every evaluation setting
+    #  recall     - [TxKxAxM] max recall for every evaluation setting
+    # Note: precision and recall==-1 for settings with no gt objects.
+    #
+    # See also coco, mask, pycocoDemo, pycocoEvalDemo
+    #
+    # Microsoft COCO Toolbox.      version 2.0
+    # Data, paper, and tutorials available at:  http://mscoco.org/
+    # Code written by Piotr Dollar and Tsung-Yi Lin, 2015.
+    # Licensed under the Simplified BSD License [see coco/license.txt]
+    def __init__(self, cocoGt=None, cocoDt=None, iouType='segm'):
+        '''
+        Initialize CocoEval using coco APIs for gt and dt
+        :param cocoGt: coco object with ground truth annotations
+        :param cocoDt: coco object with detection results
+        :return: None
+        '''
+        if not iouType:
+            print('iouType not specified. use default iouType segm')
+        self.cocoGt   = cocoGt              # ground truth COCO API
+        self.cocoDt   = cocoDt              # detections COCO API
+        self.evalImgs = defaultdict(list)   # per-image per-category evaluation results [KxAxI] elements
+        self.eval     = {}                  # accumulated evaluation results
+        self._gts = defaultdict(list)       # gt for evaluation
+        self._dts = defaultdict(list)       # dt for evaluation
+        self.params = Params(iouType=iouType) # parameters
+        self._paramsEval = {}               # parameters for evaluation
+        self.stats = []                     # result summarization
+        self.ious = {}                      # ious between all gts and dts
+        if not cocoGt is None:
+            self.params.img_ids = sorted(cocoGt.getImg_ids())
+            self.params.cat_ids = sorted(cocoGt.getCat_ids())
+
+
+    def _prepare(self):
+        '''
+        Prepare ._gts and ._dts for evaluation based on params
+        :return: None
+        '''
+#         def _toMask(anns, coco):
+#             # modify ann['segmentation'] by reference
+#             for ann in anns:
+#                 rle = coco.annToRLE(ann)
+#                 ann['segmentation'] = rle
+        p = self.params
+        if p.useCats:
+            gts=self.cocoGt.load_anns(self.cocoGt.get_ann_ids(img_ids=p.img_ids, cat_ids=p.cat_ids))
+            dts=self.cocoDt.load_anns(self.cocoDt.get_ann_ids(img_ids=p.img_ids, cat_ids=p.cat_ids))
+        else:
+            gts=self.cocoGt.load_anns(self.cocoGt.get_ann_ids(img_ids=p.img_ids))
+            dts=self.cocoDt.load_anns(self.cocoDt.get_ann_ids(img_ids=p.img_ids))
+
+        # convert ground truth to mask if iouType == 'segm'
+        if p.iouType == 'segm':
+            raise NotImplementedError
+#             _toMask(gts, self.cocoGt)
+#             _toMask(dts, self.cocoDt)
+        # set ignore flag
+        for gt in gts:
+            gt['ignore'] = gt['ignore'] if 'ignore' in gt else 0
+            gt['ignore'] = 'iscrowd' in gt and gt['iscrowd']
+            if p.iouType == 'keypoints':
+                gt['ignore'] = (gt['num_keypoints'] == 0) or gt['ignore']
+        self._gts = defaultdict(list)       # gt for evaluation
+        self._dts = defaultdict(list)       # dt for evaluation
+        for gt in gts:
+            self._gts[gt['image_id'], gt['category_id']].append(gt)
+        for dt in dts:
+            self._dts[dt['image_id'], dt['category_id']].append(dt)
+        self.evalImgs = defaultdict(list)   # per-image per-category evaluation results
+        self.eval     = {}                  # accumulated evaluation results
+
+    def evaluate(self):
+        '''
+        Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
+        :return: None
+        '''
+        tic = time.time()
+        print('Running per image evaluation...')
+        p = self.params
+        # add backward compatibility if useSegm is specified in params
+        if not p.useSegm is None:
+            p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
+            print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
+        print('Evaluate annotation type *{}*'.format(p.iouType))
+        p.img_ids = list(np.unique(p.img_ids))
+        if p.useCats:
+            p.cat_ids = list(np.unique(p.cat_ids))
+        p.maxDets = sorted(p.maxDets)
+        self.params=p
+
+        self._prepare()
+        # loop through images, area range, max detection number
+        cat_ids = p.cat_ids if p.useCats else [-1]
+
+        if p.iouType == 'segm' or p.iouType == 'bbox':
+            computeIoU = self.computeIoU
+        elif p.iouType == 'keypoints':
+            computeIoU = self.computeOks
+        self.ious = {(imgId, catId): computeIoU(imgId, catId)                         for imgId in p.img_ids
+                        for catId in cat_ids}
+
+        evaluateImg = self.evaluateImg
+        maxDet = p.maxDets[-1]
+        self.evalImgs = [evaluateImg(imgId, catId, areaRng, maxDet)
+                 for catId in cat_ids
+                 for areaRng in p.areaRng
+                 for imgId in p.img_ids
+             ]
+        self._paramsEval = copy.deepcopy(self.params)
+        toc = time.time()
+        print('DONE (t={:0.2f}s).'.format(toc-tic))
+
+    def computeIoU(self, imgId, catId):
+        p = self.params
+        if p.useCats:
+            gt = self._gts[imgId,catId]
+            dt = self._dts[imgId,catId]
+        else:
+            gt = [_ for cId in p.cat_ids for _ in self._gts[imgId,cId]]
+            dt = [_ for cId in p.cat_ids for _ in self._dts[imgId,cId]]
+        if len(gt) == 0 and len(dt) ==0:
+            return []
+        inds = np.argsort([-d['score'] for d in dt], kind='mergesort')
+        dt = [dt[i] for i in inds]
+        if len(dt) > p.maxDets[-1]:
+            dt=dt[0:p.maxDets[-1]]
+
+        if p.iouType == 'segm':
+            g = [g['segmentation'] for g in gt]
+            d = [d['segmentation'] for d in dt]
+        elif p.iouType == 'bbox':
+            g = [g['bbox'] for g in gt]
+            d = [d['bbox'] for d in dt]
+        else:
+            raise Exception('unknown iouType for iou computation')
+
+        # compute iou between each dt and gt region
+        iscrowd = [int(o['iscrowd']) for o in gt]
+        #jump
+#         yolo_bbox_overlaps
+        ious = maskUtils.iou(d,g,iscrowd)
+        return ious
+
+    def computeOks(self, imgId, catId):
+        p = self.params
+        # dimention here should be Nxm
+        gts = self._gts[imgId, catId]
+        dts = self._dts[imgId, catId]
+        inds = np.argsort([-d['score'] for d in dts], kind='mergesort')
+        dts = [dts[i] for i in inds]
+        if len(dts) > p.maxDets[-1]:
+            dts = dts[0:p.maxDets[-1]]
+        # if len(gts) == 0 and len(dts) == 0:
+        if len(gts) == 0 or len(dts) == 0:
+            return []
+        ious = np.zeros((len(dts), len(gts)))
+        sigmas = p.kpt_oks_sigmas
+        vars = (sigmas * 2)**2
+        k = len(sigmas)
+        # compute oks between each detection and ground truth object
+        for j, gt in enumerate(gts):
+            # create bounds for ignore regions(double the gt bbox)
+            g = np.array(gt['keypoints'])
+            xg = g[0::3]; yg = g[1::3]; vg = g[2::3]
+            k1 = np.count_nonzero(vg > 0)
+            bb = gt['bbox']
+            x0 = bb[0] - bb[2]; x1 = bb[0] + bb[2] * 2
+            y0 = bb[1] - bb[3]; y1 = bb[1] + bb[3] * 2
+            for i, dt in enumerate(dts):
+                d = np.array(dt['keypoints'])
+                xd = d[0::3]; yd = d[1::3]
+                if k1>0:
+                    # measure the per-keypoint distance if keypoints visible
+                    dx = xd - xg
+                    dy = yd - yg
+                else:
+                    # measure minimum distance to keypoints in (x0,y0) & (x1,y1)
+                    z = np.zeros((k))
+                    dx = np.max((z, x0-xd),axis=0)+np.max((z, xd-x1),axis=0)
+                    dy = np.max((z, y0-yd),axis=0)+np.max((z, yd-y1),axis=0)
+                e = (dx**2 + dy**2) / vars / (gt['area']+np.spacing(1)) / 2
+                if k1 > 0:
+                    e=e[vg > 0]
+                ious[i, j] = np.sum(np.exp(-e)) / e.shape[0]
+        return ious
+
+    def evaluateImg(self, imgId, catId, aRng, maxDet):
+        '''
+        perform evaluation for single category and image
+        :return: dict (single image results)
+        '''
+        p = self.params
+        if p.useCats:
+            gt = self._gts[imgId,catId]
+            dt = self._dts[imgId,catId]
+        else:
+            gt = [_ for cId in p.cat_ids for _ in self._gts[imgId,cId]]
+            dt = [_ for cId in p.cat_ids for _ in self._dts[imgId,cId]]
+        if len(gt) == 0 and len(dt) ==0:
+            return None
+
+        for g in gt:
+            if g['ignore'] or (g['area']<aRng[0] or g['area']>aRng[1]):
+                g['_ignore'] = 1
+            else:
+                g['_ignore'] = 0
+
+        # sort dt highest score first, sort gt ignore last
+        gtind = np.argsort([g['_ignore'] for g in gt], kind='mergesort')
+        gt = [gt[i] for i in gtind]
+        dtind = np.argsort([-d['score'] for d in dt], kind='mergesort')
+        dt = [dt[i] for i in dtind[0:maxDet]]
+        iscrowd = [int(o['iscrowd']) for o in gt]
+        # load computed ious
+        ious = self.ious[imgId, catId][:, gtind] if len(self.ious[imgId, catId]) > 0 else self.ious[imgId, catId]
+
+        T = len(p.iouThrs)
+        G = len(gt)
+        D = len(dt)
+        gtm  = np.zeros((T,G))
+        dtm  = np.zeros((T,D))
+        gtIg = np.array([g['_ignore'] for g in gt])
+        dtIg = np.zeros((T,D))
+        if not len(ious)==0:
+            for tind, t in enumerate(p.iouThrs):
+                for dind, d in enumerate(dt):
+                    # information about best match so far (m=-1 -> unmatched)
+                    iou = min([t,1-1e-10])
+                    m   = -1
+                    for gind, g in enumerate(gt):
+                        # if this gt already matched, and not a crowd, continue
+                        if gtm[tind,gind]>0 and not iscrowd[gind]:
+                            continue
+                        # if dt matched to reg gt, and on ignore gt, stop
+                        if m>-1 and gtIg[m]==0 and gtIg[gind]==1:
+                            break
+                        # continue to next gt unless better match made
+                        if ious[dind,gind] < iou:
+                            continue
+                        # if match successful and best so far, store appropriately
+                        iou=ious[dind,gind]
+                        m=gind
+                    # if match made store id of match for both dt and gt
+                    if m ==-1:
+                        continue
+                    dtIg[tind,dind] = gtIg[m]
+                    dtm[tind,dind]  = gt[m]['id']
+                    gtm[tind,m]     = d['id']
+        # set unmatched detections outside of area range to ignore
+        a = np.array([d['area']<aRng[0] or d['area']>aRng[1] for d in dt]).reshape((1, len(dt)))
+        dtIg = np.logical_or(dtIg, np.logical_and(dtm==0, np.repeat(a,T,0)))
+        # store results for given image and category
+        return {
+                'image_id':     imgId,
+                'category_id':  catId,
+                'aRng':         aRng,
+                'maxDet':       maxDet,
+                'dt_ids':        [d['id'] for d in dt],
+                'gt_ids':        [g['id'] for g in gt],
+                'dtMatches':    dtm,
+                'gtMatches':    gtm,
+                'dtScores':     [d['score'] for d in dt],
+                'gtIgnore':     gtIg,
+                'dtIgnore':     dtIg,
+            }
+
+    def accumulate(self, p = None):
+        '''
+        Accumulate per image evaluation results and store the result in self.eval
+        :param p: input params for evaluation
+        :return: None
+        '''
+        print('Accumulating evaluation results...')
+        tic = time.time()
+        if not self.evalImgs:
+            print('Please run evaluate() first')
+        # allows input customized parameters
+        if p is None:
+            p = self.params
+        p.cat_ids = p.cat_ids if p.useCats == 1 else [-1]
+        T           = len(p.iouThrs)
+        R           = len(p.recThrs)
+        K           = len(p.cat_ids) if p.useCats else 1
+        A           = len(p.areaRng)
+        M           = len(p.maxDets)
+        precision   = -np.ones((T,R,K,A,M)) # -1 for the precision of absent categories
+        recall      = -np.ones((T,K,A,M))
+        scores      = -np.ones((T,R,K,A,M))
+
+        # create dictionary for future indexing
+        _pe = self._paramsEval
+        cat_ids = _pe.cat_ids if _pe.useCats else [-1]
+        setK = set(cat_ids)
+        setA = set(map(tuple, _pe.areaRng))
+        setM = set(_pe.maxDets)
+        setI = set(_pe.img_ids)
+        # get inds to evaluate
+        k_list = [n for n, k in enumerate(p.cat_ids)  if k in setK]
+        m_list = [m for n, m in enumerate(p.maxDets) if m in setM]
+        a_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.areaRng)) if a in setA]
+        i_list = [n for n, i in enumerate(p.img_ids)  if i in setI]
+        I0 = len(_pe.img_ids)
+        A0 = len(_pe.areaRng)
+        # retrieve E at each category, area range, and max number of detections
+        for k, k0 in enumerate(k_list):
+            Nk = k0*A0*I0
+            for a, a0 in enumerate(a_list):
+                Na = a0*I0
+                for m, maxDet in enumerate(m_list):
+                    E = [self.evalImgs[Nk + Na + i] for i in i_list]
+                    E = [e for e in E if not e is None]
+                    if len(E) == 0:
+                        continue
+                    dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
+
+                    # different sorting method generates slightly different results.
+                    # mergesort is used to be consistent as Matlab implementation.
+                    inds = np.argsort(-dtScores, kind='mergesort')
+                    dtScoresSorted = dtScores[inds]
+
+                    dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
+                    dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
+                    gtIg = np.concatenate([e['gtIgnore'] for e in E])
+                    npig = np.count_nonzero(gtIg==0 )
+                    if npig == 0:
+                        continue
+                    tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
+                    fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
+
+                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
+                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+                    for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
+                        tp = np.array(tp)
+                        fp = np.array(fp)
+                        nd = len(tp)
+                        rc = tp / npig
+                        pr = tp / (fp+tp+np.spacing(1))
+                        q  = np.zeros((R,))
+                        ss = np.zeros((R,))
+
+                        if nd:
+                            recall[t,k,a,m] = rc[-1]
+                        else:
+                            recall[t,k,a,m] = 0
+
+                        # numpy is slow without cython optimization for accessing elements
+                        # use python array gets significant speed improvement
+                        pr = pr.tolist(); q = q.tolist()
+
+                        for i in range(nd-1, 0, -1):
+                            if pr[i] > pr[i-1]:
+                                pr[i-1] = pr[i]
+
+                        inds = np.searchsorted(rc, p.recThrs, side='left')
+                        try:
+                            for ri, pi in enumerate(inds):
+                                q[ri] = pr[pi]
+                                ss[ri] = dtScoresSorted[pi]
+                        except:
+                            pass
+                        precision[t,:,k,a,m] = np.array(q)
+                        scores[t,:,k,a,m] = np.array(ss)
+        self.eval = {
+            'params': p,
+            'counts': [T, R, K, A, M],
+            'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'precision': precision,
+            'recall':   recall,
+            'scores': scores,
+        }
+        toc = time.time()
+        print('DONE (t={:0.2f}s).'.format( toc-tic))
+
+    def summarize(self):
+        '''
+        Compute and display summary metrics for evaluation results.
+        Note this functin can *only* be applied on the default parameter setting
+        '''
+        def _summarize( ap=1, iouThr=None, areaRng='all', maxDets=100 ):
+            p = self.params
+            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.3f}'
+            titleStr = 'Average Precision' if ap == 1 else 'Average Recall'
+            typeStr = '(AP)' if ap==1 else '(AR)'
+            iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1])                 if iouThr is None else '{:0.2f}'.format(iouThr)
+
+            aind = [i for i, aRng in enumerate(p.areaRngLbl) if aRng == areaRng]
+            mind = [i for i, mDet in enumerate(p.maxDets) if mDet == maxDets]
+            if ap == 1:
+                # dimension of precision: [TxRxKxAxM]
+                s = self.eval['precision']
+                # IoU
+                if iouThr is not None:
+                    t = np.where(iouThr == p.iouThrs)[0]
+                    s = s[t]
+                s = s[:,:,:,aind,mind]
+            else:
+                # dimension of recall: [TxKxAxM]
+                s = self.eval['recall']
+                if iouThr is not None:
+                    t = np.where(iouThr == p.iouThrs)[0]
+                    s = s[t]
+                s = s[:,:,aind,mind]
+            if len(s[s>-1])==0:
+                mean_s = -1
+            else:
+                mean_s = np.mean(s[s>-1])
+            print(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, mean_s))
+            return mean_s
+        def _summarizeDets():
+            stats = np.zeros((12,))
+            stats[0] = _summarize(1)
+            stats[1] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2])
+            stats[2] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2])
+            stats[3] = _summarize(1, areaRng='small', maxDets=self.params.maxDets[2])
+            stats[4] = _summarize(1, areaRng='medium', maxDets=self.params.maxDets[2])
+            stats[5] = _summarize(1, areaRng='large', maxDets=self.params.maxDets[2])
+            stats[6] = _summarize(0, maxDets=self.params.maxDets[0])
+            stats[7] = _summarize(0, maxDets=self.params.maxDets[1])
+            stats[8] = _summarize(0, maxDets=self.params.maxDets[2])
+            stats[9] = _summarize(0, areaRng='small', maxDets=self.params.maxDets[2])
+            stats[10] = _summarize(0, areaRng='medium', maxDets=self.params.maxDets[2])
+            stats[11] = _summarize(0, areaRng='large', maxDets=self.params.maxDets[2])
+            return stats
+        def _summarizeKps():
+            stats = np.zeros((10,))
+            stats[0] = _summarize(1, maxDets=20)
+            stats[1] = _summarize(1, maxDets=20, iouThr=.5)
+            stats[2] = _summarize(1, maxDets=20, iouThr=.75)
+            stats[3] = _summarize(1, maxDets=20, areaRng='medium')
+            stats[4] = _summarize(1, maxDets=20, areaRng='large')
+            stats[5] = _summarize(0, maxDets=20)
+            stats[6] = _summarize(0, maxDets=20, iouThr=.5)
+            stats[7] = _summarize(0, maxDets=20, iouThr=.75)
+            stats[8] = _summarize(0, maxDets=20, areaRng='medium')
+            stats[9] = _summarize(0, maxDets=20, areaRng='large')
+            return stats
+        if not self.eval:
+            raise Exception('Please run accumulate() first')
+        iouType = self.params.iouType
+        if iouType == 'segm' or iouType == 'bbox':
+            summarize = _summarizeDets
+        elif iouType == 'keypoints':
+            summarize = _summarizeKps
+        self.stats = summarize()
+
+    def __str__(self):
+        self.summarize()
+
+
+# In[ ]:
+
+
+
+
+
+# In[72]:
+
+
+def eval_recalls(gts,
+                 proposals,
+                 proposal_nums=None,
+                 iou_thrs=0.5,
+                 logger=None,
+                 use_legacy_coordinate=False):
+    """Calculate recalls.
+
+    Args:
+        gts (list[ndarray]): a list of arrays of shape (n, 4)
+        proposals (list[ndarray]): a list of arrays of shape (k, 4) or (k, 5)
+        proposal_nums (int | Sequence[int]): Top N proposals to be evaluated.
+        iou_thrs (float | Sequence[float]): IoU thresholds. Default: 0.5.
+        logger (logging.Logger | str | None): The way to print the recall
+            summary. See `mmengine.logging.print_log()` for details.
+            Default: None.
+        use_legacy_coordinate (bool): Whether use coordinate system
+            in mmdet v1.x. "1" was added to both height and width
+            which means w, h should be
+            computed as 'x2 - x1 + 1` and 'y2 - y1 + 1'. Default: False.
+
+
+    Returns:
+        ndarray: recalls of different ious and proposal nums
+    """
+
+    img_num = len(gts)
+    assert img_num == len(proposals)
+    proposal_nums, iou_thrs = set_recall_param(proposal_nums, iou_thrs)
+    all_ious = []
+    for i in range(img_num):
+        if proposals[i].ndim == 2 and proposals[i].shape[1] == 5:
+            scores = proposals[i][:, 4]
+            sort_idx = np.argsort(scores)[::-1]
+            img_proposal = proposals[i][sort_idx, :]
+        else:
+            img_proposal = proposals[i]
+        prop_num = min(img_proposal.shape[0], proposal_nums[-1])
+        if gts[i] is None or gts[i].shape[0] == 0:
+            ious = np.zeros((0, img_proposal.shape[0]), dtype=np.float32)
+        else:
+            ious = bbox_overlaps(
+                gts[i],
+                img_proposal[:prop_num, :4],
+                use_legacy_coordinate=use_legacy_coordinate)
+        all_ious.append(ious)
+    all_ious = np.array(all_ious)
+    img_num = all_ious.shape[0]
+    total_gt_num = sum([ious.shape[0] for ious in all_ious])
+
+    _ious = np.zeros((proposal_nums.size, total_gt_num), dtype=np.float32)
+    for k, proposal_num in enumerate(proposal_nums):
+        tmp_ious = np.zeros(0)
+        for i in range(img_num):
+            ious = all_ious[i][:, :proposal_num].copy()
+            gt_ious = np.zeros((ious.shape[0]))
+            if ious.size == 0:
+                tmp_ious = np.hstack((tmp_ious, gt_ious))
+                continue
+            for j in range(ious.shape[0]):
+                gt_max_overlaps = ious.argmax(axis=1)
+                max_ious = ious[np.arange(0, ious.shape[0]), gt_max_overlaps]
+                gt_idx = max_ious.argmax()
+                gt_ious[j] = max_ious[gt_idx]
+                box_idx = gt_max_overlaps[gt_idx]
+                ious[gt_idx, :] = -1
+                ious[:, box_idx] = -1
+            tmp_ious = np.hstack((tmp_ious, gt_ious))
+        _ious[k, :] = tmp_ious
+
+    _ious = np.fliplr(np.sort(_ious, axis=1))
+    recalls = np.zeros((proposal_nums.size, thrs.size))
+    for i, thr in enumerate(thrs):
+        recalls[:, i] = (_ious >= thr).sum(axis=1) / float(total_gt_num)
+    proposal_nums = np.array(proposal_nums, dtype=np.int32)
+    iou_thrs = np.array(iou_thrs)
+    if row_idxs is None:
+        row_idxs = np.arange(proposal_nums.size)
+    if col_idxs is None:
+        col_idxs = np.arange(iou_thrs.size)
+    row_header = [''] + iou_thrs[col_idxs].tolist()
+    table_data = [row_header]
+    for i, num in enumerate(proposal_nums[row_idxs]):
+        row = [f'{val:.3f}' for val in recalls[row_idxs[i], col_idxs].tolist()]
+        row.insert(0, num)
+        table_data.append(row)
+    print(table_data)
+    # print_recall_summary(recalls, proposal_nums, iou_thrs, logger=logger)
+    return recalls
+
+
+# In[ ]:
+
+
+
+
+
+# In[73]:
+
+
+class DetTTAModel:
+    """Merge augmented detection results, only bboxes corresponding score under
+    flipping and multi-scale resizing can be processed now.
+
+    Examples:
+        >>> tta_model = dict(
+        >>>     type='DetTTAModel',
+        >>>     tta_cfg=dict(nms=dict(
+        >>>                     type='nms',
+        >>>                     iou_threshold=0.5),
+        >>>                     max_per_img=100))
+        >>>
+        >>> tta_pipeline = [
+        >>>     dict(type='LoadImageFromFile',
+        >>>          backend_args=None),
+        >>>     dict(
+        >>>         type='TestTimeAug',
+        >>>         transforms=[[
+        >>>             dict(type='Resize',
+        >>>                  scale=(1333, 800),
+        >>>                  keep_ratio=True),
+        >>>         ], [
+        >>>             dict(type='RandomFlip', prob=1.),
+        >>>             dict(type='RandomFlip', prob=0.)
+        >>>         ], [
+        >>>             dict(
+        >>>                 type='PackDetInputs',
+        >>>                 meta_keys=('img_id', 'img_path', 'ori_shape',
+        >>>                         'img_shape', 'scale_factor', 'flip',
+        >>>                         'flip_direction'))
+        >>>         ]])]
+    """
+
+    def __init__(self, tta_cfg=None):
+        self.tta_cfg = tta_cfg
+
+    def merge_aug_bboxes(self, aug_bboxes: List[jt.Var],
+                         aug_scores: List[jt.Var],
+                         img_metas: List[str]) -> Tuple[jt.Var, jt.Var]:
+        """Merge augmented detection bboxes and scores.
+
+        Args:
+            aug_bboxes (list[Tensor]): shape (n, 4*#class)
+            aug_scores (list[Tensor] or None): shape (n, #class)
+        Returns:
+            tuple[Tensor]: ``bboxes`` with shape (n,4), where
+            4 represent (tl_x, tl_y, br_x, br_y)
+            and ``scores`` with shape (n,).
+        """
+        recovered_bboxes = []
+        for bboxes, img_info in zip(aug_bboxes, img_metas):
+            ori_shape = img_info['ori_shape']
+            flip = img_info['flip']
+            flip_direction = img_info['flip_direction']
+            if flip:
+                bboxes = bbox_flip(
+                    bboxes=bboxes,
+                    img_shape=ori_shape,
+                    direction=flip_direction)
+            recovered_bboxes.append(bboxes)
+        bboxes = jt.cat(recovered_bboxes, dim=0)
+        if aug_scores is None:
+            return bboxes
+        else:
+            scores = jt.cat(aug_scores, dim=0)
+            return bboxes, scores
+
+    def merge_preds(self, data_samples_list: List[List[DetDataSample]]):
+        """Merge batch predictions of enhanced data.
+
+        Args:
+            data_samples_list (List[List[DetDataSample]]): List of predictions
+                of all enhanced data. The outer list indicates images, and the
+                inner list corresponds to the different views of one image.
+                Each element of the inner list is a ``DetDataSample``.
+        Returns:
+            List[DetDataSample]: Merged batch prediction.
+        """
+        merged_data_samples = []
+        for data_samples in data_samples_list:
+            merged_data_samples.append(self._merge_single_sample(data_samples))
+        return merged_data_samples
+
+    def _merge_single_sample(
+            self, data_samples: List[DetDataSample]) -> DetDataSample:
+        """Merge predictions which come form the different views of one image
+        to one prediction.
+
+        Args:
+            data_samples (List[DetDataSample]): List of predictions
+            of enhanced data which come form one image.
+        Returns:
+            List[DetDataSample]: Merged prediction.
+        """
+        aug_bboxes = []
+        aug_scores = []
+        aug_labels = []
+        img_metas = []
+        # TODO: support instance segmentation TTA
+        assert data_samples[0].pred_instances.get('masks', None) is None,             'TTA of instance segmentation does not support now.'
+        for data_sample in data_samples:
+            aug_bboxes.append(data_sample.pred_instances.bboxes)
+            aug_scores.append(data_sample.pred_instances.scores)
+            aug_labels.append(data_sample.pred_instances.labels)
+            img_metas.append(data_sample.metainfo)
+
+        merged_bboxes, merged_scores = self.merge_aug_bboxes(
+            aug_bboxes, aug_scores, img_metas)
+        merged_labels = jt.cat(aug_labels, dim=0)
+
+        if merged_bboxes.numel() == 0:
+            return data_samples[0]
+
+        det_bboxes, keep_idxs = batched_nms(merged_bboxes, merged_scores,
+                                            merged_labels, self.tta_cfg.nms)
+
+        det_bboxes = det_bboxes[:self.tta_cfg.max_per_img]
+        det_labels = merged_labels[keep_idxs][:self.tta_cfg.max_per_img]
+
+        results = InstanceData()
+        _det_bboxes = det_bboxes.clone()
+        results.bboxes = _det_bboxes[:, :-1]
+        results.scores = _det_bboxes[:, -1]
+        results.labels = det_labels
+        det_results = data_samples[0]
+        det_results.pred_instances = results
+        return det_results
+
+
+# In[ ]:
+
+
+
+
+
+# In[74]:
+
+
+class CocoMetric:
+    """COCO evaluation metric.
+
+    Evaluate AR, AP, and mAP for detection tasks including proposal/box
+    detection and instance segmentation. Please refer to
+    https://cocodataset.org/#detection-eval for more details.
+
+    Args:
+        ann_file (str, optional): Path to the coco format annotation file.
+            If not specified, ground truth annotations from the dataset will
+            be converted to coco format. Defaults to None.
+        metric (str | List[str]): Metrics to be evaluated. Valid metrics
+            include 'bbox', 'segm', 'proposal', and 'proposal_fast'.
+            Defaults to 'bbox'.
+        classwise (bool): Whether to evaluate the metric class-wise.
+            Defaults to False.
+        proposal_nums (Sequence[int]): Numbers of proposals to be evaluated.
+            Defaults to (100, 300, 1000).
+        iou_thrs (float | List[float], optional): IoU threshold to compute AP
+            and AR. If not specified, IoUs from 0.5 to 0.95 will be used.
+            Defaults to None.
+        metric_items (List[str], optional): Metric result names to be
+            recorded in the evaluation result. Defaults to None.
+        format_only (bool): Format the output results without perform
+            evaluation. It is useful when you want to format the result
+            to a specific format and submit it to the test server.
+            Defaults to False.
+        outfile_prefix (str, optional): The prefix of json files. It includes
+            the file path and the prefix of filename, e.g., "a/b/prefix".
+            If not specified, a temp file will be created. Defaults to None.
+        file_client_args (dict, optional): Arguments to instantiate the
+            corresponding backend in mmdet <= 3.0.0rc6. Defaults to None.
+        backend_args (dict, optional): Arguments to instantiate the
+            corresponding backend. Defaults to None.
+        collect_device (str): Device name used for collecting results from
+            different ranks during distributed training. Must be 'cpu' or
+            'gpu'. Defaults to 'cpu'.
+        prefix (str, optional): The prefix that will be added in the metric
+            names to disambiguate homonymous metrics of different evaluators.
+            If prefix is not provided in the argument, self.default_prefix
+            will be used instead. Defaults to None.
+        sort_categories (bool): Whether sort categories in annotations. Only
+            used for `Objects365V1Dataset`. Defaults to False.
+        use_mp_eval (bool): Whether to use mul-processing evaluation
+    """
+    default_prefix: Optional[str] = 'coco'
+
+    def __init__(self,
+                 ann_file: Optional[str] = None,
+                 metric: Union[str, List[str]] = 'bbox',
+                 classwise: bool = False,
+                 proposal_nums: Sequence[int] = (100, 300, 1000),
+                 iou_thrs: Optional[Union[float, Sequence[float]]] = None,
+                 metric_items: Optional[Sequence[str]] = None,
+                 format_only: bool = False,
+                 outfile_prefix: Optional[str] = None,
+                 file_client_args: dict = None,
+                 backend_args: dict = None,
+                 collect_device: str = 'cpu',
+                 prefix: Optional[str] = None,
+                 sort_categories: bool = False,
+                 collect_dir: Optional[str] = None,
+                 use_mp_eval: bool = False) -> None:
+        if collect_dir is not None and collect_device != 'cpu':
+            raise ValueError('`collec_dir` could only be configured when '
+                             "`collect_device='cpu'`")
+
+        self._dataset_meta: Union[None, dict] = None
+        self.collect_device = collect_device
+        self.results: List[Any] = []
+        self.prefix = prefix or self.default_prefix
+        self.collect_dir = collect_dir
+        # coco evaluation metrics
+        self.metrics = metric if isinstance(metric, list) else [metric]
+        allowed_metrics = ['bbox', 'segm', 'proposal', 'proposal_fast']
+        for metric in self.metrics:
+            if metric not in allowed_metrics:
+                raise KeyError(
+                    "metric should be one of 'bbox', 'segm', 'proposal', "
+                    f"'proposal_fast', but got {metric}.")
+
+        # do class wise evaluation, default False
+        self.classwise = classwise
+        # whether to use multi processing evaluation, default False
+        self.use_mp_eval = use_mp_eval
+
+        # proposal_nums used to compute recall or precision.
+        self.proposal_nums = list(proposal_nums)
+
+        # iou_thrs used to compute recall or precision.
+        if iou_thrs is None:
+            iou_thrs = np.linspace(
+                .5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
+        self.iou_thrs = iou_thrs
+        self.metric_items = metric_items
+        self.format_only = format_only
+        if self.format_only:
+            assert outfile_prefix is not None, 'outfile_prefix must be not'
+            'None when format_only is True, otherwise the result files will'
+            'be saved to a temp directory which will be cleaned up at the end.'
+
+        self.outfile_prefix = outfile_prefix
+
+        self.backend_args = backend_args
+        if file_client_args is not None:
+            raise RuntimeError(
+                'The `file_client_args` is deprecated, '
+                'please use `backend_args` instead, please refer to'
+                'https://github.com/open-mmlab/mmdetection/blob/main/configs/_base_/datasets/coco_detection.py'  # noqa: E501
+            )
+
+        # if ann_file is not specified,
+        # initialize coco api with the converted dataset
+        if ann_file is not None:
+            with get_local_path(
+                    ann_file) as local_path:
+                self._coco_api = COCO(local_path)
+                if sort_categories:
+                    # 'categories' list in objects365_train.json and
+                    # objects365_val.json is inconsistent, need sort
+                    # list(or dict) before get cat_ids.
+                    cats = self._coco_api.cats
+                    sorted_cats = {i: cats[i] for i in sorted(cats)}
+                    self._coco_api.cats = sorted_cats
+                    categories = self._coco_api.dataset['categories']
+                    sorted_categories = sorted(
+                        categories, key=lambda i: i['id'])
+                    self._coco_api.dataset['categories'] = sorted_categories
+        else:
+            self._coco_api = None
+
+        # handle dataset lazy init
+        # there changed
+        # self.cat_ids = None
+        self.cat_ids = [0,1,2,3,4,5,6,7,8,9,10,11]
+        self.img_ids = None
+
+    def fast_eval_recall(self,
+                         results: List[dict],
+                         proposal_nums: Sequence[int],
+                         iou_thrs: Sequence[float],
+                         logger: Optional[Any] = None) -> np.ndarray:
+        """Evaluate proposal recall with COCO's fast_eval_recall.
+
+        Args:
+            results (List[dict]): Results of the dataset.
+            proposal_nums (Sequence[int]): Proposal numbers used for
+                evaluation.
+            iou_thrs (Sequence[float]): IoU thresholds used for evaluation.
+            logger (MMLogger, optional): Logger used for logging the recall
+                summary.
+        Returns:
+            np.ndarray: Averaged recall results.
+        """
+        gt_bboxes = []
+        pred_bboxes = [result['bboxes'] for result in results]
+        for i in range(len(self.img_ids)):
+            ann_ids = self._coco_api.get_ann_ids(img_ids=self.img_ids[i])
+            ann_info = self._coco_api.load_anns(ann_ids)
+            if len(ann_info) == 0:
+                gt_bboxes.append(np.zeros((0, 4)))
+                continue
+            bboxes = []
+            for ann in ann_info:
+                if ann.get('ignore', False) or ann['iscrowd']:
+                    continue
+                x1, y1, w, h = ann['bbox']
+                bboxes.append([x1, y1, x1 + w, y1 + h])
+            bboxes = np.array(bboxes, dtype=np.float32)
+            if bboxes.shape[0] == 0:
+                bboxes = np.zeros((0, 4))
+            gt_bboxes.append(bboxes)
+
+        recalls = eval_recalls(
+            gt_bboxes, pred_bboxes, proposal_nums, iou_thrs, logger=logger)
+        ar = recalls.mean(axis=1)
+        return ar
+
+    def xyxy2xywh(self, bbox: np.ndarray) -> list:
+        """Convert ``xyxy`` style bounding boxes to ``xywh`` style for COCO
+        evaluation.
+
+        Args:
+            bbox (numpy.ndarray): The bounding boxes, shape (4, ), in
+                ``xyxy`` order.
+
+        Returns:
+            list[float]: The converted bounding boxes, in ``xywh`` order.
+        """
+
+        _bbox: List = bbox.tolist()
+        return [
+            _bbox[0],
+            _bbox[1],
+            _bbox[2] - _bbox[0],
+            _bbox[3] - _bbox[1],
+        ]
+
+    def results2json(self, results: Sequence[dict],
+                     outfile_prefix: str) -> dict:
+        """Dump the detection results to a COCO style json file.
+
+        There are 3 types of results: proposals, bbox predictions, mask
+        predictions, and they have different data types. This method will
+        automatically recognize the type, and dump them to json files.
+
+        Args:
+            results (Sequence[dict]): Testing results of the
+                dataset.
+            outfile_prefix (str): The filename prefix of the json files. If the
+                prefix is "somepath/xxx", the json files will be named
+                "somepath/xxx.bbox.json", "somepath/xxx.segm.json",
+                "somepath/xxx.proposal.json".
+
+        Returns:
+            dict: Possible keys are "bbox", "segm", "proposal", and
+            values are corresponding filenames.
+        """
+        bbox_json_results = []
+        segm_json_results = [] if 'masks' in results[0] else None
+        test = True
+        for idx, result in enumerate(results):
+            image_id = result.get('img_id', idx)
+            labels = result['labels']
+            bboxes = result['bboxes']
+            scores = result['scores']
+            # bbox results
+            for i, label in enumerate(labels):
+                data = dict()
+                data['image_id'] = image_id
+                data['bbox'] = self.xyxy2xywh(bboxes[i])
+                data['score'] = float(scores[i])
+                data['category_id'] = self.cat_ids[label]
+                # try:
+                #     data['category_id'] = self.cat_ids[label] #todo here comes something wrong
+                # except IndexError:
+                #     print(f'MAIN label {label} is not in category ')
+                # if test:
+                #     for ii in range(100):
+                #         try:
+                #             print(f'label {ii} is in category {self.cat_ids[ii]}')
+                #             # print(f'label {i} is in category {self.cat_ids[i]},labels: {labels},result: {results}')
+                #         except IndexError:
+                #             # print(f'label {i} is not in category ,labels: {labels}')
+                #             print(f'label {ii} is not in category')
+                #         if ii == 20:
+                #             break
+                #             test = False
+
+                # try:
+                #     data['category_id'] = self.cat_ids[label] #todo here comes something wrong
+                # except IndexError:
+                #     print(f'label {label} is not in category ')
+                #
+                #     for i in range(100):
+                #         try:
+                #             print(f'label {i} is in category {self.cat_ids[i]}')
+                #             # print(f'label {i} is in category {self.cat_ids[i]},labels: {labels},result: {results}')
+                #         except IndexError:
+                #             # print(f'label {i} is not in category ,labels: {labels}')
+                #             print(f'label {i} is not in category')
+                #         # try:
+                #         #     print(f'label {i+1} is in category {self.cat_ids[i+1]}')
+                #         # except IndexError:
+                #         #     break
+                #             if i == 20:
+                #                 break
+                #             continue
+                #     break #调试
+                bbox_json_results.append(data)
+
+            if segm_json_results is None:
+                continue
+
+            # segm results
+            masks = result['masks']
+            mask_scores = result.get('mask_scores', scores)
+            for i, label in enumerate(labels):
+                data = dict()
+                data['image_id'] = image_id
+                data['bbox'] = self.xyxy2xywh(bboxes[i])
+                data['score'] = float(mask_scores[i])
+                data['category_id'] = self.cat_ids[label]
+                if isinstance(masks[i]['counts'], bytes):
+                    masks[i]['counts'] = masks[i]['counts'].decode()
+                data['segmentation'] = masks[i]
+                segm_json_results.append(data)
+
+        result_files = dict()
+        result_files['bbox'] = f'{outfile_prefix}.bbox.json'
+        result_files['proposal'] = f'{outfile_prefix}.bbox.json'
+        dump(bbox_json_results, result_files['bbox'])
+
+        if segm_json_results is not None:
+            result_files['segm'] = f'{outfile_prefix}.segm.json'
+            dump(segm_json_results, result_files['segm'])
+
+        return result_files
+
+    def gt_to_coco_json(self, gt_dicts: Sequence[dict],
+                        outfile_prefix: str) -> str:
+        """Convert ground truth to coco format json file.
+
+        Args:
+            gt_dicts (Sequence[dict]): Ground truth of the dataset.
+            outfile_prefix (str): The filename prefix of the json files. If the
+                prefix is "somepath/xxx", the json file will be named
+                "somepath/xxx.gt.json".
+        Returns:
+            str: The filename of the json file.
+        """
+        categories = [
+            dict(id=id, name=name)
+            for id, name in enumerate(self.dataset_meta['classes'])
+        ]
+        image_infos = []
+        annotations = []
+
+        for idx, gt_dict in enumerate(gt_dicts):
+            img_id = gt_dict.get('img_id', idx)
+            image_info = dict(
+                id=img_id,
+                width=gt_dict['width'],
+                height=gt_dict['height'],
+                file_name='')
+            image_infos.append(image_info)
+            for ann in gt_dict['anns']:
+                label = ann['bbox_label']
+                bbox = ann['bbox']
+                coco_bbox = [
+                    bbox[0],
+                    bbox[1],
+                    bbox[2] - bbox[0],
+                    bbox[3] - bbox[1],
+                ]
+
+                annotation = dict(
+                    id=len(annotations) +
+                    1,  # coco api requires id starts with 1
+                    image_id=img_id,
+                    bbox=coco_bbox,
+                    iscrowd=ann.get('ignore_flag', 0),
+                    category_id=int(label),
+                    area=coco_bbox[2] * coco_bbox[3])
+                if ann.get('mask', None):
+                    mask = ann['mask']
+                    # area = mask_util.area(mask)
+                    if isinstance(mask, dict) and isinstance(
+                            mask['counts'], bytes):
+                        mask['counts'] = mask['counts'].decode()
+                    annotation['segmentation'] = mask
+                    # annotation['area'] = float(area)
+                annotations.append(annotation)
+
+        info = dict(
+            date_created=str(datetime.datetime.now()),
+            description='Coco json file converted by mmdet CocoMetric.')
+        coco_json = dict(
+            info=info,
+            images=image_infos,
+            categories=categories,
+            licenses=None,
+        )
+        if len(annotations) > 0:
+            coco_json['annotations'] = annotations
+        converted_json_path = f'{outfile_prefix}.gt.json'
+        dump(coco_json, converted_json_path)
+        return converted_json_path
+
+    # TODO: data_batch is no longer needed, consider adjusting the
+    #  parameter position
+    def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
+        """Process one batch of data samples and predictions. The processed
+        results should be stored in ``self.results``, which will be used to
+        compute the metrics when all batches have been processed.
+
+        Args:
+            data_batch (dict): A batch of data from the dataloader.
+            data_samples (Sequence[dict]): A batch of data samples that
+                contain annotations and predictions.
+        """
+        for data_sample in data_samples:
+            result = dict()
+            pred = data_sample['pred_instances']
+            result['img_id'] = data_sample['img_id']
+            result['bboxes'] = pred['bboxes'].cpu().numpy()
+            result['scores'] = pred['scores'].cpu().numpy()
+            result['labels'] = pred['labels'].cpu().numpy()
+            # encode mask to RLE
+            if 'masks' in pred:
+                result['masks'] = pred['masks']
+            # some detectors use different scores for bbox and mask
+            if 'mask_scores' in pred:
+                result['mask_scores'] = pred['mask_scores'].cpu().numpy()
+
+            # parse gt
+            gt = dict()
+            gt['width'] = data_sample['ori_shape'][1]
+            gt['height'] = data_sample['ori_shape'][0]
+            gt['img_id'] = data_sample['img_id']
+            if self._coco_api is None:
+                # TODO: Need to refactor to support LoadAnnotations
+                assert 'instances' in data_sample,                     'ground truth is required for evaluation when '                     '`ann_file` is not provided'
+                gt['anns'] = data_sample['instances']
+            # add converted result to the results list
+            self.results.append((gt, result))
+
+    def compute_metrics(self, results: list) -> Dict[str, float]:
+        """Compute the metrics from processed results.
+
+        Args:
+            results (list): The processed results of each batch.
+
+        Returns:
+            Dict[str, float]: The computed metrics. The keys are the names of
+            the metrics, and the values are corresponding results.
+        """
+        # logger: MMLogger = MMLogger.get_current_instance()
+
+        # split gt and prediction list
+        gts, preds = zip(*results)
+
+        tmp_dir = None
+        if self.outfile_prefix is None:
+            tmp_dir = tempfile.TemporaryDirectory()
+            outfile_prefix = osp.join(tmp_dir.name, 'results')
+        else:
+            outfile_prefix = self.outfile_prefix
+
+        if self._coco_api is None:
+            # use converted gt json file to initialize coco api
+            print('Converting ground truth to coco format...')
+            coco_json_path = self.gt_to_coco_json(
+                gt_dicts=gts, outfile_prefix=outfile_prefix)
+            self._coco_api = COCO(coco_json_path)
+
+        # handle lazy init
+        if self.cat_ids is None:
+            self.cat_ids = self._coco_api.get_cat_ids(
+                cat_names=self.dataset_meta['classes'])
+        if self.img_ids is None:
+            self.img_ids = self._coco_api.get_img_ids()
+
+        # convert predictions to coco format and dump to json file
+        result_files = self.results2json(preds, outfile_prefix)
+
+        eval_results = OrderedDict()
+        if self.format_only:
+            print('results are saved in '
+                        f'{osp.dirname(outfile_prefix)}')
+            return eval_results
+
+        for metric in self.metrics:
+            print(f'Evaluating {metric}...')
+
+            # TODO: May refactor fast_eval_recall to an independent metric?
+            # fast eval recall
+            if metric == 'proposal_fast':
+                ar = self.fast_eval_recall(
+                    preds, self.proposal_nums, self.iou_thrs, logger=logger)
+                log_msg = []
+                for i, num in enumerate(self.proposal_nums):
+                    eval_results[f'AR@{num}'] = ar[i]
+                    log_msg.append(f'\nAR@{num}\t{ar[i]:.4f}')
+                log_msg = ''.join(log_msg)
+                print(log_msg)
+                continue
+
+            # evaluate proposal, bbox and segm
+            iou_type = 'bbox' if metric == 'proposal' else metric
+            if metric not in result_files:
+                raise KeyError(f'{metric} is not in results')
+            try:
+                predictions = load(result_files[metric])
+                if iou_type == 'segm':
+                    # Refer to https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/coco.py#L331  # noqa
+                    # When evaluating mask AP, if the results contain bbox,
+                    # cocoapi will use the box area instead of the mask area
+                    # for calculating the instance area. Though the overall AP
+                    # is not affected, this leads to different
+                    # small/medium/large mask AP results.
+                    for x in predictions:
+                        x.pop('bbox')
+                coco_dt = self._coco_api.loadRes(predictions)
+
+            except IndexError:
+                print(
+                    'The testing results of the whole dataset is empty.')
+                break
+
+            if self.use_mp_eval:
+                raise NotImplementedError
+                # coco_eval = COCOevalMP(self._coco_api, coco_dt, iou_type)
+            else:
+                coco_eval = COCOeval(self._coco_api, coco_dt, iou_type)
+
+            coco_eval.params.catIds = self.cat_ids
+            coco_eval.params.imgIds = self.img_ids
+            coco_eval.params.maxDets = list(self.proposal_nums)
+            coco_eval.params.iouThrs = self.iou_thrs
+
+            # mapping of cocoEval.stats
+            coco_metric_names = {
+                'mAP': 0,
+                'mAP_50': 1,
+                'mAP_75': 2,
+                'mAP_s': 3,
+                'mAP_m': 4,
+                'mAP_l': 5,
+                'AR@100': 6,
+                'AR@300': 7,
+                'AR@1000': 8,
+                'AR_s@1000': 9,
+                'AR_m@1000': 10,
+                'AR_l@1000': 11
+            }
+            metric_items = self.metric_items
+            if metric_items is not None:
+                for metric_item in metric_items:
+                    if metric_item not in coco_metric_names:
+                        raise KeyError(
+                            f'metric item "{metric_item}" is not supported')
+
+            if metric == 'proposal':
+                coco_eval.params.useCats = 0
+                coco_eval.evaluate()
+                coco_eval.accumulate()
+                coco_eval.summarize()
+                if metric_items is None:
+                    metric_items = [
+                        'AR@100', 'AR@300', 'AR@1000', 'AR_s@1000',
+                        'AR_m@1000', 'AR_l@1000'
+                    ]
+
+                for item in metric_items:
+                    val = float(
+                        f'{coco_eval.stats[coco_metric_names[item]]:.3f}')
+                    eval_results[item] = val
+            else:
+                coco_eval.evaluate()
+                coco_eval.accumulate()
+                coco_eval.summarize()
+                if self.classwise:  # Compute per-category AP
+                    # Compute per-category AP
+                    # from https://github.com/facebookresearch/detectron2/
+                    precisions = coco_eval.eval['precision']
+                    # precision: (iou, recall, cls, area range, max dets)
+                    assert len(self.cat_ids) == precisions.shape[2]
+
+                    results_per_category = []
+                    for idx, cat_id in enumerate(self.cat_ids):
+                        t = []
+                        # area range index 0: all area ranges
+                        # max dets index -1: typically 100 per image
+                        nm = self._coco_api.load_cats(cat_id)[0]
+                        precision = precisions[:, :, idx, 0, -1]
+                        precision = precision[precision > -1]
+                        if precision.size:
+                            ap = np.mean(precision)
+                        else:
+                            ap = float('nan')
+                        t.append(f'{nm["name"]}')
+                        t.append(f'{round(ap, 3)}')
+                        eval_results[f'{nm["name"]}_precision'] = round(ap, 3)
+
+                        # indexes of IoU  @50 and @75
+                        for iou in [0, 5]:
+                            precision = precisions[iou, :, idx, 0, -1]
+                            precision = precision[precision > -1]
+                            if precision.size:
+                                ap = np.mean(precision)
+                            else:
+                                ap = float('nan')
+                            t.append(f'{round(ap, 3)}')
+
+                        # indexes of area of small, median and large
+                        for area in [1, 2, 3]:
+                            precision = precisions[:, :, idx, area, -1]
+                            precision = precision[precision > -1]
+                            if precision.size:
+                                ap = np.mean(precision)
+                            else:
+                                ap = float('nan')
+                            t.append(f'{round(ap, 3)}')
+                        results_per_category.append(tuple(t))
+
+                    num_columns = len(results_per_category[0])
+                    results_flatten = list(
+                        itertools.chain(*results_per_category))
+                    headers = [
+                        'category', 'mAP', 'mAP_50', 'mAP_75', 'mAP_s',
+                        'mAP_m', 'mAP_l'
+                    ]
+                    results_2d = itertools.zip_longest(*[
+                        results_flatten[i::num_columns]
+                        for i in range(num_columns)
+                    ])
+                    table_data = [headers]
+                    table_data += [result for result in results_2d]
+                    print(table_data)
+                    # table = AsciiTable(table_data)
+                    # logger.info('\n' + table.table)
+
+                if metric_items is None:
+                    metric_items = [
+                        'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l'
+                    ]
+
+                for metric_item in metric_items:
+                    key = f'{metric}_{metric_item}'
+                    val = coco_eval.stats[coco_metric_names[metric_item]]
+                    eval_results[key] = float(f'{round(val, 3)}')
+
+                ap = coco_eval.stats[:6]
+                print(f'{metric}_mAP_copypaste: {ap[0]:.3f} '
+                    f'{ap[1]:.3f} {ap[2]:.3f} {ap[3]:.3f} '
+                    f'{ap[4]:.3f} {ap[5]:.3f}')
+
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+        return eval_results
+
+
+# In[ ]:
+
+
+
+
+
+# In[75]:
 
 
 _backend_args = None
@@ -11190,7 +12840,7 @@ last_transform = [Albu(bbox_params=dict(
 
 
 
-# In[72]:
+# In[76]:
 
 
 train_pipeline = ([
@@ -11327,7 +12977,7 @@ val_pipeline = [
 
 
 
-# In[73]:
+# In[77]:
 
 
 backbone = RemNet(
@@ -11346,7 +12996,7 @@ backbone = RemNet(
 
 
 
-# In[74]:
+# In[78]:
 
 
 data_preprocessor = YOLOv5DetDataPreprocessor(
@@ -11370,7 +13020,7 @@ data_preprocessor = YOLOv5DetDataPreprocessor(
 
 
 
-# In[75]:
+# In[79]:
 
 
 head_module = YOLOv8HeadModule(
@@ -11407,7 +13057,7 @@ prior_generator = MlvlPointGenerator(
 
 
 
-# In[76]:
+# In[80]:
 
 
 neck = RemDetPAFPN(
@@ -11435,7 +13085,7 @@ neck = RemDetPAFPN(
 
 
 
-# In[77]:
+# In[81]:
 
 
 loss_bbox = YOLO_IoULoss(
@@ -11462,7 +13112,7 @@ loss_dfl = DistributionFocalLoss(
 
 
 
-# In[78]:
+# In[82]:
 
 
 bbox_head = YOLOv8Head(
@@ -11490,37 +13140,7 @@ bbox_head = YOLOv8Head(
 
 
 
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[79]:
+# In[83]:
 
 
 train_dataset = YOLOv5CocoDataset(
@@ -11530,10 +13150,10 @@ train_dataset = YOLOv5CocoDataset(
     filter_cfg=dict(filter_empty_gt=False, min_size=32),
     metainfo=metainfo,
     pipeline = train_pipeline,
-    batch_size=train_batch_size_per_gpu, 
-    shuffle=True, 
-    num_workers=train_num_workers, 
-    persistent_workers=True, 
+    batch_size=train_batch_size_per_gpu,
+    shuffle=True,
+    num_workers=train_num_workers,
+    persistent_workers=True,
     collate_fn = yolov5_collate)
 train_dataset_stage2 = YOLOv5CocoDataset(
     ann_file = train_ann_file,
@@ -11542,10 +13162,10 @@ train_dataset_stage2 = YOLOv5CocoDataset(
     filter_cfg=dict(filter_empty_gt=False, min_size=32),
     metainfo=metainfo,
     pipeline = train_pipeline_stage2,
-    batch_size=train_batch_size_per_gpu, 
-    shuffle=True, 
-    num_workers=train_num_workers, 
-    persistent_workers=True, 
+    batch_size=train_batch_size_per_gpu,
+    shuffle=True,
+    num_workers=train_num_workers,
+    persistent_workers=True,
     collate_fn = yolov5_collate)
 val_dataset = YOLOv5CocoDataset(
     test_mode=True,
@@ -11556,11 +13176,19 @@ val_dataset = YOLOv5CocoDataset(
     data_root=data_root,
     metainfo=metainfo,
     batch_size=val_batch_size_per_gpu,
-    num_workers=val_num_workers, 
-    persistent_workers=True, 
-    collate_fn = yolov5_collate, 
-    drop_last=False, 
+    num_workers=val_num_workers,
+    persistent_workers=True,
+    collate_fn = yolov5_collate,
+    drop_last=False,
     shuffle=False)
+
+
+# In[84]:
+
+
+# print(*train_dataset)
+# print(jt.in_mpi)
+#jump
 
 
 # In[ ]:
@@ -11569,7 +13197,21 @@ val_dataset = YOLOv5CocoDataset(
 
 
 
-# In[80]:
+# In[85]:
+
+
+tta_module = DetTTAModel(
+    tta_cfg=dict(max_per_img=300, nms=dict(iou_threshold=0.65, type='nms'))
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[86]:
 
 
 module = YOLODetector(
@@ -11585,26 +13227,49 @@ optimizer = jt.optim.SGD(
     nesterov=True,
     weight_decay=weight_decay
 )
+optim = AmpOptimWrapper(
+    optimizer = optimizer,
+    clip_grad=dict(max_norm=10.0),
+    loss_scale='dynamic'
+)
+#notice: YOLOv5OptimizerConstructor will have no efforts,so skip
 
 
-# In[ ]:
+# In[87]:
 
 
+#jump
 
 
-
-# In[81]:
+# In[89]:
 
 
 def train(epoch):
+#     print('in train')
+    module.train()
     if epoch < max_epochs - close_mosaic_epochs:
-        data = tain_dataset
-        
-        
-        
-        
+        data_stage = train_dataset
     else:
-        data = tain_dataset_stage2
+        data_stage = train_dataset_stage2
+#     print('after judge')
+#     print(epoch)
+    for data_batch in enumerate(data_stage):
+        i = 0
+        print('should print')
+        if i % 50 == 0:
+            print(
+                f'Epoch: {epoch} step:{i}'
+            )
+        data = module.data_preprocessor(data_batch)
+        _data = yolov5_collate(*data)
+        result = moudle(_data)
+        losses = module.loss(_data, data_batch)
+        loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
+        optim.step(loss)
+        print(
+                f'loss:{loss}\n{losses}'
+            )
+        i += 1
 
 
 # In[ ]:
@@ -11613,9 +13278,72 @@ def train(epoch):
 
 
 
-# In[82]:
+# In[90]:
+
+
+val_evaluator = CocoMetric(
+    ann_file=data_root + val_ann_file,
+    metric='bbox',
+    proposal_nums=(
+        100,
+        1,
+        10,
+    )
+)
+
+
+# In[ ]:
+
+
+
+
+
+# In[91]:
+
+
+def val(epoch):
+    module.eval()
+    for data_batch in enumerate(val_dataset):
+        if i % 50 == 0:
+            print(
+                f'Epoch: {epoch} step:{i}'
+            )
+        i = 0
+        data = module.data_preprocessor(data_batch)
+        _data = yolov5_collate(*data)
+        result = moudle.predict(_data)
+        val_loss = module.loss(_data, data_batch)
+        evaluator.process(data_samples=result, data_batch=data_batch)
+        metrics = evaluator.evaluate(len(val_dataset))
+        
+        loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
+        print(
+                f'loss:{loss}\n{losses}'
+            )
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
 
 
 if __name__ == '__main__':
     mp.set_start_method('fork',force = True)
+    # len(module)
+    # len(train_dataset)
+    for i in range(10):
+#         print('in')
+        train(i + 1)
+#         print('out')
+    
+
+
+# In[ ]:
+
+
+
 
