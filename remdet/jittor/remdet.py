@@ -3,7 +3,7 @@
 
 # In[1]:
 
-
+import numbers
 import jittor as jt
 from jittor import nn,Module,init
 import json
@@ -29,6 +29,7 @@ import cv2
 import warnings
 from contextlib import contextmanager
 from io import BytesIO, StringIO
+import io
 from pathlib import Path
 import shutil
 from collections.abc import Mapping
@@ -39,23 +40,78 @@ import pickle
 import time
 import itertools
 import gc
+import datetime
 from contextlib import contextmanager
-from jittor.misc import _pair
+# from jittor.misc import _pair
 import tempfile
 from pycocotools import mask as maskUtils
+from cv2 import (IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_IGNORE_ORIENTATION,
+                 IMREAD_UNCHANGED)
+import sys
+PYTHON_VERSION = sys.version_info[0]
+# SampleList = List[DetDataSample]
 
+imread_flags = {
+    'color': IMREAD_COLOR,
+    'grayscale': IMREAD_GRAYSCALE,
+    'unchanged': IMREAD_UNCHANGED,
+    'color_ignore_orientation': IMREAD_IGNORE_ORIENTATION | IMREAD_COLOR,
+    'grayscale_ignore_orientation':
+    IMREAD_IGNORE_ORIENTATION | IMREAD_GRAYSCALE
+}
 T = TypeVar("T")
+cv2_interp_codes = {
+    'nearest': cv2.INTER_NEAREST,
+    'bilinear': cv2.INTER_LINEAR,
+    'bicubic': cv2.INTER_CUBIC,
+    'area': cv2.INTER_AREA,
+    'lanczos': cv2.INTER_LANCZOS4
+}
 
+cv2_border_modes = {
+    'constant': cv2.BORDER_CONSTANT,
+    'replicate': cv2.BORDER_REPLICATE,
+    'reflect': cv2.BORDER_REFLECT,
+    'wrap': cv2.BORDER_WRAP,
+    'reflect_101': cv2.BORDER_REFLECT_101,
+    'transparent': cv2.BORDER_TRANSPARENT,
+    'isolated': cv2.BORDER_ISOLATED
+}
+
+# Pillow >=v9.1.0 use a slightly different naming scheme for filters.
+# Set pillow_interp_codes according to the naming scheme used.
+if Image is not None:
+    if hasattr(Image, 'Resampling'):
+        pillow_interp_codes = {
+            'nearest': Image.Resampling.NEAREST,
+            'bilinear': Image.Resampling.BILINEAR,
+            'bicubic': Image.Resampling.BICUBIC,
+            'box': Image.Resampling.BOX,
+            'lanczos': Image.Resampling.LANCZOS,
+            'hamming': Image.Resampling.HAMMING
+        }
+    else:
+        pillow_interp_codes = {
+            'nearest': Image.NEAREST,
+            'bilinear': Image.BILINEAR,
+            'bicubic': Image.BICUBIC,
+            'box': Image.BOX,
+            'lanczos': Image.LANCZOS,
+            'hamming': Image.HAMMING
+        }
    
 
 
-# In[ ]:
-
-
-
-
-
 # In[2]:
+
+
+seed = 114514
+np.random.seed(seed)
+jt.seed(seed)
+# raise NotImplementedError('need to check padding logic see if it is same mode')
+
+
+# In[3]:
 
 
 # env settings
@@ -63,8 +119,10 @@ T = TypeVar("T")
 # Single-scale training is recommended to
 # be turned on, which can speed up training.
 
-jt.flags.use_cuda = True # wait to enable done
-device = 'cuda'
+# jt.flags.use_cuda = True # wait to enable done
+jt.flags.use_cuda = False
+# _device = 'cuda'
+_device = 'cpu'
 cv2.setNumThreads(0)
 
 #due to jittor use nccl by default and computational resources limited so there is no env_settings for disk_config
@@ -75,13 +133,14 @@ cv2.setNumThreads(0)
 # ========================Frequently modified parameters======================
 # ----data related----
 data_root = '/root/.cache/jittor/dataset/Fast Test/'# '/mnt/e/git clone/UAVDT/' # Root path of data
+data_root = '/mnt/e/git clone/Fast Test/'
 # Path of train annotation file
 train_ann_file = 'ann/fast_test.json'# 'annotations/UAV-benchmark-M-Train.json'
-train_data_prefix = 'images'# 'images/UAV-benchmark-M' # Prefix of train imagae path
+train_data_prefix = 'img'# 'images/UAV-benchmark-M' # Prefix of train imagae path
 
 # Path of val annotation file
 val_ann_file = 'ann/fast_test.json' # annotations/UAV-benchmark-M-Val.json'
-val_data_prefix = 'images' # 'images/UAV-benchmark-M' # Prefix of val image path
+val_data_prefix = 'img' # 'images/UAV-benchmark-M' # Prefix of val image path
 
 # here we use fast test to test if the module can run normally
 # classes = ("pedestrian", "people", "bicycle", "car", "van", "truck", "tricycle", "awning-tricycle", "bus", "motor")
@@ -192,7 +251,7 @@ param_scheduler = None
 
 
 
-# In[3]:
+# In[4]:
 
 
 metainfo = dict(classes = classes)
@@ -204,9 +263,162 @@ metainfo = dict(classes = classes)
 
 
 
-# In[4]:
+# In[5]:
 
 
+def min_(x:jt.Var,y:jt.Var):
+    return jt.where(x < y , x , y)
+def max_(x:jt.Var,y:jt.Var):
+    return jt.where(x > y , x , y)
+def _get_rescale_ratio(old_size: Tuple[int, int],
+                           scale: Union[float, Tuple[int]]) -> float:
+
+        """Calculate the ratio for rescaling.
+
+        Args:
+            old_size (tuple[int]): The old size (w, h) of image.
+            scale (float | tuple[int]): The scaling factor or maximum size.
+                If it is a float number, then the image will be rescaled by
+                this factor, else if it is a tuple of 2 integers, then
+                the image will be rescaled as large as possible within
+                the scale.
+
+        Returns:
+            float: The resize ratio.
+        """
+        w, h = old_size
+        if isinstance(scale, (float, int)):
+            if scale <= 0:
+                raise ValueError(f'Invalid scale {scale}, must be positive.')
+            scale_factor = scale
+        elif isinstance(scale, tuple):
+            max_long_edge = max(scale)
+            max_short_edge = min(scale)
+            scale_factor = min(max_long_edge / max(w, h),
+                               max_short_edge / min(w, h))
+        else:
+            raise TypeError('Scale must be a number or tuple of int, '
+                            f'but got {type(scale)}')
+
+        return scale_factor
+def _scale_size(
+    size: Tuple[int, int],
+    scale: Union[float, int, Tuple[float, float], Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Rescale a size by a ratio.
+
+    Args:
+        size (tuple[int]): (w, h).
+        scale (float | int | tuple(float) | tuple(int)): Scaling factor.
+
+    Returns:
+        tuple[int]: scaled size.
+    """
+    if isinstance(scale, (float, int)):
+        scale = (scale, scale)
+    w, h = size
+    return int(w * float(scale[0]) + 0.5), int(h * float(scale[1]) + 0.5)
+def bbox_project(bbox,w_matrix): # TODO if for compatibility can replace jt with np
+        bboxes = np.array(bbox)
+        wrap_matrix = np.array(w_matrix)
+        x1, y1, x2, y2 = bboxes[..., 0], bboxes[..., 1], bboxes[..., 2], bboxes[..., 3]
+        # print(x1, y1, x2, y2)
+        ver = np.stack([
+            np.stack([x1, y1], axis=1),
+            np.stack([x2, y1], axis=1),
+            np.stack([x1, y2], axis=1),
+            np.stack([x2, y2], axis=1),
+        ],axis=1)
+        # print(ver)
+        h_var = np.concatenate([
+            ver,
+            np.ones((
+                ver.shape[0],
+                ver.shape[1],
+                1
+            ))],axis = 2
+        )
+        # print(f'a.shape')
+        axes = list(range(h_var.ndim - 2)) + [-1, -2]
+        # print(h_var,)
+        corners_T = np.transpose(h_var,axes)
+        # print(corners_T)
+        corners_T = np.matmul(wrap_matrix, corners_T)
+        t_h = np.transpose(corners_T,axes)
+        # Convert to homogeneous coordinates by normalization
+        # corners = corners[..., :2] / corners[..., 2:3]
+        # print(h_var)
+        # print(f'wrap_matrix:{wrap_matrix}')
+        # t_h = np.einsum('ij,nkj -> nki',wrap_matrix,h_var)
+        # print(f't_h:{t_h}')
+        w = t_h[..., 2:3]
+        t_v = t_h[..., :2] / w
+        n_x1 = t_v[...,0].min(axis=1)
+        n_y1 = t_v[...,1].min(axis=1)
+        n_x2 = t_v[...,0].max(axis=1)
+        n_y2 = t_v[...,1].max(axis = 1)
+        # print(n_x1,'\n',n_y1,'\n',n_x2,'\n',n_y2)
+        # raise NotImplementedError('test')
+        bboxes = np.stack([n_x1,n_y1,n_x2,n_y2],axis=1)
+        # assert len(bboxes) == 4
+        return bboxes
+
+
+def bbox_is_inside(bboxes,area:list):
+
+        width ,height = area
+        cond1 = (bboxes[...,0] >=0) & (bboxes[...,0]< width)
+        cond2 = (bboxes[...,1] >=0) & (bboxes[...,1]< height)
+        cond3 = (bboxes[...,2] <= width) & (bboxes[...,2]>=0)
+        cond4 = (bboxes[...,3] <= height) & (bboxes[...,3]>=0)
+        return cond1 & cond2 & cond3 & cond4
+def imresize(
+    img: np.ndarray,
+    size: Tuple[int, int],
+    return_scale: bool = False,
+    interpolation: str = 'bilinear',
+    out: Optional[np.ndarray] = None,
+    backend: Optional[str] = None
+) -> Union[Tuple[np.ndarray, float, float], np.ndarray]:
+    """Resize image to a given size.
+
+    Args:
+        img (ndarray): The input image.
+        size (tuple[int]): Target size (w, h).
+        return_scale (bool): Whether to return `w_scale` and `h_scale`.
+        interpolation (str): Interpolation method, accepted values are
+            "nearest", "bilinear", "bicubic", "area", "lanczos" for 'cv2'
+            backend, "nearest", "bilinear" for 'pillow' backend.
+        out (ndarray): The output destination.
+        backend (str | None): The image resize backend type. Options are `cv2`,
+            `pillow`, `None`. If backend is None, the global imread_backend
+            specified by ``mmcv.use_backend()`` will be used. Default: None.
+
+    Returns:
+        tuple | ndarray: (`resized_img`, `w_scale`, `h_scale`) or
+        `resized_img`.
+    """
+    h, w = img.shape[:2]
+    if backend is None:
+        backend = 'cv2'
+    if backend not in ['cv2', 'pillow']:
+        raise ValueError(f'backend: {backend} is not supported for resize.'
+                         f"Supported backends are 'cv2', 'pillow'")
+
+    if backend == 'pillow':
+        assert img.dtype == np.uint8, 'Pillow backend only support uint8 type'
+        pil_image = Image.fromarray(img)
+        pil_image = pil_image.resize(size, pillow_interp_codes[interpolation])
+        resized_img = np.array(pil_image)
+    else:
+        resized_img = cv2.resize(
+            img, size, dst=out, interpolation=cv2_interp_codes[interpolation])
+    if not return_scale:
+        return resized_img
+    else:
+        w_scale = size[0] / w
+        h_scale = size[1] / h
+        return resized_img, w_scale, h_scale
 def multi_apply(func, *args, **kwargs):
     """Apply function to a list of arguments.
 
@@ -313,7 +525,7 @@ def list_from_file(filename,
                    backend_args=None):
     cnt = 0
     item_list = []
-    with open(filepath, encoding=encoding) as f:
+    with open(filename, encoding=encoding) as f:
         text = f.read()
     with StringIO(text) as f:
         for _ in range(offset):
@@ -337,18 +549,34 @@ def yolov5_collate(data_batch: Sequence,
     batch_masks = []
     batch_keyponits = []
     batch_keypoints_visible = []
-    for i in range(len(data_batch)):
-        datasamples = data_batch[i]['data_samples']
-        inputs = data_batch[i]['inputs']
+    meta_info = []
+#     print(f'data_batch:{data_batch}')
+    for i in range(1, len(data_batch) + 1):
+#         print(len(data_batch))
+#         print(data_batch)
+#         datasamples = data_batch[i]['data_samples']
+#         inputs = data_batch[i]['inputs']
+#TODO: need to check on big dataset
+        # warnings.warn('need to check on big dataset')
+        datasamples = data_batch['data_samples']
+#         print(datasamples)
+        meta = datasamples.metainfo
+        meta_info.append(meta)
+#         print(meta_info)
+#         assert len(meta_info) == 1
+#         print(f'data_batch.meta_infomation:{meta}')
+#         raise NotImplementedError('fix logic')
+        inputs = data_batch['inputs']
         batch_imgs.append(inputs)
 
-        gt_bboxes = datasamples.gt_instances.bboxes.tensor
-        gt_labels = datasamples.gt_instances.labels
+        gt_bboxes = jt.array(datasamples.gt_instances.bboxes)
+        gt_labels = jt.array(datasamples.gt_instances.labels)
         if 'masks' in datasamples.gt_instances:
             masks = datasamples.gt_instances.masks
             batch_masks.append(masks)
         if 'gt_panoptic_seg' in datasamples:
-            batch_masks.append(datasamples.gt_panoptic_seg.pan_seg)
+            raise NotImplementedError('gt_panoptic_seg should not in datasamples')
+#             batch_masks.append(datasamples.gt_panoptic_seg.pan_seg)
         if 'keypoints' in datasamples.gt_instances:
             keypoints = datasamples.gt_instances.keypoints
             keypoints_visible = datasamples.gt_instances.keypoints_visible
@@ -356,6 +584,11 @@ def yolov5_collate(data_batch: Sequence,
             batch_keypoints_visible.append(keypoints_visible)
 
         batch_idx = gt_labels.new_full((len(gt_labels), 1), i)
+#         print(f'batch_idx:{batch_idx.numpy()}')
+#         print(f'gt_labels[:, None]:{gt_labels[:, None].numpy()}')
+#         print(f'gt_bboxes:{gt_bboxes.numpy()}')
+#         print(f'gt_labels[:, None]:{gt_labels[:, None].numpy()}')
+#         print(f'gt_bboxes.shape:{gt_bboxes.shape}')
         bboxes_labels = jt.cat((batch_idx, gt_labels[:, None], gt_bboxes),
                                   dim=1)
         batch_bboxes_labels.append(bboxes_labels)
@@ -364,6 +597,7 @@ def yolov5_collate(data_batch: Sequence,
             'bboxes_labels': jt.cat(batch_bboxes_labels, 0)
         }
     }
+    collated_results['img_metas'] = meta_info
     if len(batch_masks) > 0:
         collated_results['data_samples']['masks'] = jt.cat(batch_masks, 0)
 
@@ -398,7 +632,7 @@ def yolov5_collate(data_batch: Sequence,
 
 
 
-# In[5]:
+# In[6]:
 
 
 class COCO:
@@ -426,7 +660,7 @@ class COCO:
 
         print('Loading and preparing results...')
         tic = time.time()
-        if type(resFile) == str or (PYTHON_VERSION == 2 and type(resFile) == unicode):
+        if type(resFile) == str or (PYTHON_VERSION == 2):
             anns = json.load(open(resFile))
         elif type(resFile) == np.ndarray:
             anns = self.loadNumpyAnnotations(resFile)
@@ -434,7 +668,7 @@ class COCO:
             anns = resFile
         assert type(anns) == list, 'results in not an array of objects'
         annsImgIds = [ann['image_id'] for ann in anns]
-        assert set(annsImgIds) == (set(annsImgIds) & set(self.getImgIds())),                'Results do not correspond to current coco set'
+        assert set(annsImgIds) == (set(annsImgIds) & set(self.get_img_ids())),                'Results do not correspond to current coco set'
         if 'caption' in anns[0]:
             imgIds = set([img['id'] for img in res.dataset['images']]) & set([ann['image_id'] for ann in anns])
             res.dataset['images'] = [img for img in res.dataset['images'] if img['id'] in imgIds]
@@ -482,7 +716,7 @@ class COCO:
         """
         print('Converting ndarray to lists...')
         assert(type(data) == np.ndarray)
-        print(data.shape)
+        # print(data.shape)
         assert(data.shape[1] == 7)
         N = data.shape[0]
         ann = []
@@ -643,19 +877,19 @@ class COCO:
 
 
 
+# In[7]:
+
+
+# raise NotImplementedError('scale function have something wrong with it,need to check.YOLO_MOsicx')
+
+
 # In[ ]:
 
 
 
 
 
-# In[ ]:
-
-
-
-
-
-# In[6]:
+# In[8]:
 
 
 # ===============================Unmodified in most cases====================
@@ -684,7 +918,7 @@ class LoadYOLOAnnotations:
                  poly2mask: bool = False,
                  merge_polygons: bool = True,
                  with_mask: bool = False,
-                 box_type: str = 'hbox',
+                 box_type: str = None,
                  # use for semseg
                  reduce_zero_label: bool = False,
                  ignore_index: int = 255,
@@ -735,8 +969,8 @@ class LoadYOLOAnnotations:
             results['gt_bboxes'] = gt_bboxes
         elif self.with_keypoints:
             self._load_kps(results)
-            _, box_type_cls = get_box_type(self.box_type)
-            results['gt_bboxes'] = box_type_cls(
+            # _, box_type_cls = get_box_type(self.box_type)
+            results['gt_bboxes'] = jt.array(
                 results.get('bbox', []), dtype=jt.float32)
         else:
             if self.with_bbox:
@@ -748,6 +982,7 @@ class LoadYOLOAnnotations:
             if self.with_keypoints:
                 self._load_kps(results)
             self._update_mask_ignore_data(results)
+        # print(f'in {self.__class__}')
         return results
 
     def _update_mask_ignore_data(self, results: dict) -> None:
@@ -946,10 +1181,10 @@ class LoadYOLOAnnotations:
                 (0, len(results['flip_indices'])), dtype=np.int32)
             results['category_id'] = []
 
-        results['gt_keypoints'] = Keypoints(
+        results['gt_keypoints'] = dict(
             keypoints=results['keypoints'],
             keypoints_visible=results['keypoints_visible'],
-            flip_indices=results['flip_indices'],
+            flip_indices=results['flip_indices']
         )
 
         results['gt_ignore_flags'] = np.array([False] * num_instances)
@@ -980,22 +1215,30 @@ class LoadYOLOAnnotations:
 
 
 
-# In[7]:
+# In[9]:
 
 
 #Notcie here I decide to make the data in resault to be np.ndarray(some function did not support jt.Var)
 def bbox_clip(bboxes,area):
-    width ,height = enumerate(area)
-    bboxes[...,0] = bboxes[...,0].clip(min=0)
-    bboxes[...,1] = bboxes[...,1].clip(min=0)
-    bboxes[...,2] = bboxes[...,2].clip(max=width)
-    bboxes[...,3] = bboxes[...,3].clip(max=height)
+    # width ,height = area
+    # # print(width,height)
+    # # raise TypeError
+    # bboxes[...,0] = bboxes[...,0].clip(min=0,max=width)
+    # bboxes[...,1] = bboxes[...,1].clip(min=0,max=height)
+    # bboxes[...,2] = bboxes[...,2].clip(min=0,max=width)
+    # bboxes[...,3] = bboxes[...,3].clip(min=0,max=height)
+    bboxes[..., 0::2] = bboxes[..., 0::2].clip(min=0, max=area[1])
+    bboxes[..., 1::2] = bboxes[..., 1::2].clip(min=0, max=area[0])
+
     return bboxes
 def bbox_rescale(bboxes:np.ndarray,scale_factor):
+    # print(f'rescaling bboxes {bboxes}')
     if scale_factor is not None:
         sx, sy = scale_factor[0], scale_factor[1]
         scale = np.array([sx, sy, sx, sy])
-        bboxes = bboxes / scale
+        # print(f'in bbox_rescale scale:{scale}')
+        bboxes = bboxes * scale
+        # print(f'in bbox_rescale bboxes:{bboxes}')
     return bboxes
 def _fixed_scale_size(
         size: Tuple[int, int],
@@ -1081,12 +1324,12 @@ def imrescale(
     """
     h, w = img.shape[:2]
     new_size, scale_factor = rescale_size((w, h), scale, return_scale=True)
-#     rescaled_img = imresize(
-#         img, new_size, interpolation=interpolation, backend=backend)
-    rescaled_img = transform.resize(
-        img = Image.fromarray(img), size = (new_size[1], new_size[0]), interpolation=interpolation
-    )
-    rescaled_img = rescaled_img.numpy()
+    rescaled_img = imresize(
+        img, new_size, interpolation=interpolation, backend=backend)
+#     rescaled_img = transform.resize(
+#         img = Image.fromarray(img), size = (new_size[1], new_size[0]), interpolation=interpolation
+#     )
+#     rescaled_img = rescaled_img.numpy()
     if return_scale:
         return rescaled_img, scale_factor
     else:
@@ -1096,10 +1339,13 @@ def bbox_translate(
     bboxes:np.ndarray, distance:Tuple[float, float]
 ):
     assert len(distance) == 2
-    bboxes = bboxes + np.array(distance).reshape(1, 1, 2)
+    bboxes[:, 0::2] += distance[0]
+    bboxes[:, 1::2] += distance[1]
+    # bboxes = np.expand_dims(bboxes, axis=2) + np.array(distance).reshape(1, 1, 2)
+    # print(f'in bbox_translate bboxes: {bboxes}')
     return bboxes
 # NOTE:in oringin source code img should be a np.ndarray # TODO
-def mask_translate(mask:np.ndarray, out_shape, offest, direction,border_value: Union[int, tuple] = 0):
+def mask_translate(mask:np.ndarray, out_shape, offset, direction,border_value: Union[int, tuple] = 0):
     '''
     out shape should be (w,h)
     '''
@@ -1109,7 +1355,7 @@ def mask_translate(mask:np.ndarray, out_shape, offest, direction,border_value: U
     if oringin_dim == 2:
         mask = np.expand_dims(mask, -1)
     H, W, C = mask.shape
-    mask = transform.resize(img = mask, size = (out_shape[1], out_shape[0]), interpolation='bilinear')
+    mask = imresize(img = mask, size = (out_shape[1], out_shape[0]), interpolation='bilinear')
     W, H = out_shape
     if direction == 'horizontal':
 #         translate_matrix = np.float32([[1, 0, offset], [0, 1, 0]])
@@ -1200,7 +1446,7 @@ def impad(img: np.ndarray,
     pad = ((padding[1],        padding[3]),         (padding[0],         padding[2]),(0, 0))
     if padding_mode == 'constant':
         img = np.pad(
-            img = img,
+            array = img,
             pad_width = pad,
             mode = padding_mode
         )
@@ -1208,7 +1454,7 @@ def impad(img: np.ndarray,
         img = np.pad(
             img,
             pad_width = pad,
-            mode = mode
+            mode = padding_mode
         )
 #     img = cv2.copyMakeBorder(
 #         img,
@@ -1238,9 +1484,9 @@ def imflip(img: np.ndarray, direction: str = 'horizontal') -> np.ndarray:
         return np.flip(img, axis=0)
     else:
         return np.flip(img, axis=(0, 1))
-def bbox_flip(bboxes: jt.Var,
+def bbox_flip(bboxes: np.ndarray,
               img_shape: Tuple[int],
-              direction: str = 'horizontal') -> jt.Var:
+              direction: str = 'horizontal') -> np.ndarray:
     """Flip bboxes horizontally or vertically.
 
     Args:
@@ -1254,7 +1500,7 @@ def bbox_flip(bboxes: jt.Var,
     """
     assert bboxes.shape[-1] % 4 == 0
     assert direction in ['horizontal', 'vertical', 'diagonal']
-    flipped = bboxes.clone()
+    flipped = bboxes
     if direction == 'horizontal':
         flipped[..., 0::4] = img_shape[1] - bboxes[..., 2::4]
         flipped[..., 2::4] = img_shape[1] - bboxes[..., 0::4]
@@ -1299,7 +1545,7 @@ def sample_odd_from_range(random_state, low: int, high: int) -> int:
     # Calculate number of possible odd values
     num_odd_values = (high - low) // 2 + 1
     # Generate random index and convert to corresponding odd number
-    rand_idx = random_state.randint(0, num_odd_values - 1)
+    rand_idx = random.randint(0, num_odd_values - 1)
     return low + (2 * rand_idx)
 def blur(img: np.ndarray, ksize: int) -> np.ndarray:
     array = jt.array(img)
@@ -1315,7 +1561,7 @@ def blur(img: np.ndarray, ksize: int) -> np.ndarray:
         bias = False
     )
     conv.weight = jt.nn.Parameter(kernel, need_grad = False)
-    blurred_img = conv(array).numpy()
+    blurred_img = conv(array.to(jt.float32)).numpy()
     return blurred_img
 def median_blur(img: np.ndarray, ksize: int) -> np.ndarray:
     assert ksize % 2 == 1
@@ -1324,7 +1570,7 @@ def median_blur(img: np.ndarray, ksize: int) -> np.ndarray:
     h,w = img.shape[:2]
     c = img.shape[2] if len(img.shape) == 3 else 1
     padding = ksize // 2
-    if channels == 3:
+    if c == 3:
         img = np.pad(img,(padding,padding),(padding,padding),(0,0),mode = 'edge')
     else:
         img = np.pad(img,(padding,padding),(padding,padding),mode = 'edge')
@@ -1334,7 +1580,7 @@ def median_blur(img: np.ndarray, ksize: int) -> np.ndarray:
     array.float()
     array = jt.sort(array, dim = -1)
     array = array[..., (ksize * ksize) // 2]
-    return array.numpy().astype(np.unit8)
+    return array.numpy().astype(np.uint8)
 def f(t):
     delta = 6 / 29
     return np.where( t > delta ** 3,
@@ -1352,7 +1598,7 @@ def rgb2lab(img:np.ndarray):
     img = np.where(
         img > 0.04045,
         ((img + 0.055) / 1.055) ** 2.4,
-        rgb / 12.92
+        img / 12.92
     )
     matrix = np.array(
         [0.4124564, 0.3575761, 0.1804375],
@@ -1422,8 +1668,8 @@ def to_gray(img:np.ndarray,num_output_channels: int,mode):
     return np.tile(squeezed[..., np.newaxis], (1,) * squeezed.ndim + (num_output_channels,))
 def clahe(
     img: np.ndarray,
-    clip_limit: float,
-    tile_grid_size: Tuple[int, int],
+    clip_limit: float = 40.0,
+    tile_grid_size: Tuple[int, int] = (8, 8),
 ) -> np.ndarray:
     clahe_mat = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
@@ -1434,7 +1680,23 @@ def clahe(
     img_lab[:, :, 0] = clahe_mat.apply(img_lab[:, :, 0])
 
     return cv2.cvtColor(img_lab, cv2.COLOR_LAB2RGB)
-
+    # assert isinstance(img, np.ndarray)
+    # assert img.ndim == 2
+    # assert isinstance(clip_limit, (float, int))
+    # assert is_tuple_of(tile_grid_size, int)
+    # assert len(tile_grid_size) == 2
+    #
+    # clahe = cv2.createCLAHE(clip_limit, tile_grid_size)
+    # return clahe.apply(np.array(img, dtype=np.uint8))
+def is_grayscale_image(img:np.ndarray) -> bool:
+    if img is None:
+        return False
+    if img.ndim == 2:
+        return True
+    elif img.ndim== 3:
+        return img.shape[-1] == 1
+    else:
+        return False
 
 # In[ ]:
 
@@ -1442,7 +1704,7 @@ def clahe(
 
 
 
-# In[8]:
+# In[10]:
 
 
 class DistributionFocalLoss(nn.Module):
@@ -1489,9 +1751,9 @@ class DistributionFocalLoss(nn.Module):
 #             pred, target, weight, reduction=reduction, avg_factor=avg_factor)
         dis_left = target.long()
         dis_right = dis_left + 1
-        weight_left = dis_right.float() - label
+        weight_left = dis_right.float() - target
         weight_right = target - dis_left.float()
-        loss = cross_entropy(pred, dis_left, reduction='none') * weight_left             + cross_entropy(pred, dis_right, reduction='none') * weight_right
+        loss = nn.cross_entropy_loss(pred, dis_left, reduction='none') * weight_left             + nn.cross_entropy_loss(pred, dis_right, reduction='none') * weight_right
         if weight is not None:
             loss = loss * weight
         if avg_factor is not None:
@@ -1518,7 +1780,7 @@ class DistributionFocalLoss(nn.Module):
 
 
 
-# In[9]:
+# In[11]:
 
 
 def _pillow2array(img,
@@ -1584,7 +1846,7 @@ def _pillow2array(img,
 
 
 
-# In[10]:
+# In[12]:
 
 
 def is_seq_of(seq: Any,
@@ -1609,7 +1871,7 @@ def is_seq_of(seq: Any,
         False
     """
     if seq_type is None:
-        exp_seq_type = abc.Sequence
+        exp_seq_type = Sequence
     else:
         assert isinstance(seq_type, type)
         exp_seq_type = seq_type
@@ -1649,7 +1911,8 @@ def imfrombytes(content: bytes,
     """
 
     if backend is None:
-        backend = imread_backend
+        backend = 'cv2'
+    supported_backends = ['cv2', 'pillow', 'turbojpeg', 'tifffile', 'None']
     if backend not in supported_backends:
         raise ValueError(
             f'backend: {backend} is not supported. Supported '
@@ -1673,34 +1936,37 @@ def imfrombytes(content: bytes,
         raise NotImplementedError('please import related lib,and uncomment this part')
     else:
         img_np = np.frombuffer(content, np.uint8)
-        flag = imread_flags[flag] if is_str(flag) else flag
+        flag = imread_flags[flag] if isinstance(flag, str) else flag
         img = cv2.imdecode(img_np, flag)
         if flag == IMREAD_COLOR and channel_order == 'rgb':
             cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
         return img
 
 
-# In[11]:
+# In[13]:
 
 
 def to_tensor(img:np.ndarray):
-    return transform.ToTensor(img)
+    tt = jt.array(img)
+    return tt
 def get_shape(data: Dict[str, Any]):    
     if "image" in data:
         if isinstance(data["image"], np.ndarray):
+            # print(f'data["image"].shape[:2]:{data["image"].shape[:2]}')
             height, width = data["image"].shape[:2]
             return {"height": height, "width": width}
         else:
-            raise RuntimeError(f"Unsupported image type: {type(img)}")
+            raise RuntimeError(f"Unsupported image type: {type(data["image"])}")
     if "images" in data:
         if isinstance(data["image"][0], np.ndarray):
             height, width = data["image"][0].shape[:2]
             return {"height": height, "width": width}
         else:
-            raise RuntimeError(f"Unsupported image type: {type(img)}")
+            raise RuntimeError(f"Unsupported image type: {type(data["image"][0])}")
     raise ValueError("No image or volume found in data", data.keys())
 def samplelist_boxtype2tensor(batch_data_samples):
-    for data_samples in batch_data_samples:
+#todo changed
+    for data_samples in [batch_data_samples]:
         if 'gt_instances' in data_samples:
             bboxes = data_samples.gt_instances.get('bboxes', None)
             if bboxes is not None:
@@ -1721,7 +1987,7 @@ def samplelist_boxtype2tensor(batch_data_samples):
 
 
 
-# In[12]:
+# In[14]:
 
 
 class LoadImageFromFile:
@@ -1832,6 +2098,7 @@ class LoadImageFromFile:
         results['img'] = img
         results['img_shape'] = img.shape[:2]
         results['ori_shape'] = img.shape[:2]
+        # print(f'in {self.__class__}')
         return results
 
     def __repr__(self):
@@ -1855,7 +2122,7 @@ class LoadImageFromFile:
 
 
 
-# In[13]:
+# In[15]:
 
 
 class BaseDataElement:
@@ -1923,8 +2190,8 @@ class BaseDataElement:
             model predictions. Defaults to None.
 
     Examples:
-        >>> import torch
-        >>> from mmengine.structures import BaseDataElement
+        # >>> import torch
+        # >>> from mmengine.structures import BaseDataElement
         >>> gt_instances = BaseDataElement()
         >>> bboxes = jt.rand((5, 4))
         >>> scores = jt.rand((5,))
@@ -2335,6 +2602,7 @@ class BaseDataElement:
         new_data = self.new()
         for k, v in self.items():
             if hasattr(v, 'to'):
+                raise RuntimeError('test')
                 v = v.to(*args, **kwargs)
                 data = {k: v}
                 new_data.set_data(data)
@@ -2497,7 +2765,7 @@ class BaseDataElement:
 
 
 
-# In[14]:
+# In[16]:
 
 
 def yolo_bbox_overlaps(pred: jt.Var,
@@ -2540,17 +2808,22 @@ def yolo_bbox_overlaps(pred: jt.Var,
         raise NotImplementedError
 #         pred = HorizontalBoxes.cxcywh_to_xyxy(pred)
 #         target = HorizontalBoxes.cxcywh_to_xyxy(target)
-
+#     pred = pred.numpy()
+#     target = target.numpy()
     bbox1_x1, bbox1_y1 = pred[..., 0], pred[..., 1]
     bbox1_x2, bbox1_y2 = pred[..., 2], pred[..., 3]
     bbox2_x1, bbox2_y1 = target[..., 0], target[..., 1]
     bbox2_x2, bbox2_y2 = target[..., 2], target[..., 3]
 
     # Overlap
-    overlap = (jt.min(bbox1_x2, bbox2_x2) -
-               jt.max(bbox1_x1, bbox2_x1)).clamp(0) * \
-              (jt.min(bbox1_y2, bbox2_y2) -
-               jt.max(bbox1_y1, bbox2_y1)).clamp(0)
+    overlap = (min_(bbox1_x2, bbox2_x2) -
+               max_(bbox1_x1, bbox2_x1)).clamp(0) * \
+              (min_(bbox1_y2, bbox2_y2) -
+               max_(bbox1_y1, bbox2_y1)).clamp(0)
+#     overlap = (bbox1_x1.min(bbox2_x2) -
+#                bbox1_x1.max( bbox2_x1)).clamp(0) * \
+#               (bbox1_y2.min( bbox2_y2) -
+#                bbox1_y1.max( bbox2_y1)).clamp(0)
 
     # Union
     w1, h1 = bbox1_x2 - bbox1_x1, bbox1_y2 - bbox1_y1
@@ -2564,9 +2837,9 @@ def yolo_bbox_overlaps(pred: jt.Var,
     ious = overlap / union
 
     # enclose area
-    enclose_x1y1 = jt.min(pred[..., :2], target[..., :2])
-    enclose_x2y2 = jt.max(pred[..., 2:], target[..., 2:])
-    enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min=0)
+    enclose_x1y1 = min_(pred[..., :2], target[..., :2])
+    enclose_x2y2 = max_(pred[..., 2:], target[..., 2:])
+    enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min_v=0)
 
     enclose_w = enclose_wh[..., 0]  # cw
     enclose_h = enclose_wh[..., 1]  # ch
@@ -2601,7 +2874,7 @@ def yolo_bbox_overlaps(pred: jt.Var,
         raise NotImplementedError
     
 
-    return ious.clamp(min=-1.0, max=1.0)
+    return ious.clamp(min_v=-1.0, max_v=1.0)
 
 
 # In[ ]:
@@ -2610,7 +2883,7 @@ def yolo_bbox_overlaps(pred: jt.Var,
 
 
 
-# In[15]:
+# In[17]:
 
 
 class YOLO_IoULoss(nn.Module):
@@ -2717,7 +2990,7 @@ class YOLO_IoULoss(nn.Module):
 
 
 
-# In[16]:
+# In[18]:
 
 
 class YOLOv5DetDataPreprocessor(Module):
@@ -2797,8 +3070,9 @@ class YOLOv5DetDataPreprocessor(Module):
             batch_pad_shape = self._get_pad_shape(data)
             data = self.cast_data(data)  # type: ignore
             _batch_inputs = data['inputs']  # type: ignore
+            assert isinstance(_batch_inputs, np.ndarray)
             # Process data with `pseudo_collate`.
-            if is_seq_of(_batch_inputs,jt.Var):
+            if is_seq_of(_batch_inputs,np.ndarray):
                 batch_inputs = []
                 for _batch_input in _batch_inputs:
                     # channel transform
@@ -2806,7 +3080,7 @@ class YOLOv5DetDataPreprocessor(Module):
                         _batch_input = _batch_input[[2, 1, 0], ...]  # type: ignore
                     # Convert to float after channel conversion to ensure
                     # efficiency
-                    _batch_input = _batch_input.float()  # type: ignore
+                    _batch_input = _batch_input.astype(np.float32)  # type: ignore
                     # Normalization.
                     if self._enable_normalize:
                         if self.mean.shape[0] == 3:
@@ -2821,18 +3095,33 @@ class YOLOv5DetDataPreprocessor(Module):
                 batch_inputs = stack_batch(batch_inputs, self.pad_size_divisor,
                                            self.pad_value)
             # Process data with `default_collate`.
-            elif isinstance(_batch_inputs, jt.Var):
-                assert _batch_inputs.dim() == 4, (
+            elif isinstance(_batch_inputs, np.ndarray):
+                if _batch_inputs.ndim == 3:
+#                 _batch_inputs.reshape(1,3,3,-1)
+                    run = True
+                    _batch_inputs = np.expand_dims(_batch_inputs,axis=0)
+#                     print(_batch_inputs.ndim)
+#                     warnings.warn('this is compatibile for my fast test,just for test,should not appear in actual usage')
+                assert _batch_inputs.ndim == 4, (
                     'The input of `ImgDataPreprocessor` should be a NCHW tensor '
                     'or a list of tensor, but got a tensor with shape: '
                     f'{_batch_inputs.shape}')
                 if self._channel_conversion:
                     _batch_inputs = _batch_inputs[:, [2, 1, 0], ...]
+                    
                 # Convert to float after channel conversion to ensure
                 # efficiency
-                _batch_inputs = _batch_inputs.float()
+                _batch_inputs = _batch_inputs.astype(np.float32)
+                if isinstance(_batch_inputs, np.ndarray):
+                    jt.array(_batch_inputs)
+#                 if isinstance(_batch_inputs, jt.Var):
+#                     _batch_inputs.numpy()
+#                 if isinstance(_batch_inputs, jt.Var):
+#                     _batch_inputs.numpy()
+                
                 if self._enable_normalize:
-                    _batch_inputs = (_batch_inputs - self.mean) / self.std
+                    _batch_inputs = (_batch_inputs - self.mean.reshape(1,-1,1,1)) / self.std.reshape(1,-1,1,1)
+#                     _batch_inputs = (_batch_inputs - self.mean.reshape(-1,1)) / self.std.reshape(-1, 1)
                 h, w = _batch_inputs.shape[2:]
                 target_h = math.ceil(
                     h / self.pad_size_divisor) * self.pad_size_divisor
@@ -2846,21 +3135,29 @@ class YOLOv5DetDataPreprocessor(Module):
                 raise TypeError('Output of `cast_data` should be a dict of '
                                 'list/tuple with inputs and data_samples, '
                                 f'but got {type(data)}: {data}')  # type: ignore
+            if run:
+                batch_inputs = batch_inputs.squeeze(dim=0)
             data['inputs'] = batch_inputs  # type: ignore
             data.setdefault('data_samples', None)  # type: ignore
             data = data  # type: ignore
+#             print(data)
             inputs, data_samples = data['inputs'], data['data_samples']
-
+#             data_samples = 
             if data_samples is not None:
-                # NOTE the batched image size information may be useful, e.g.
-                # in DETR, this is needed for the construction of masks, which is
-                # then used for the transformer_head.
+#                 NOTE the batched image size information may be useful, e.g.
+#                 in DETR, this is needed for the construction of masks, which is
+#                 then used for the transformer_head.
                 batch_input_shape = tuple(inputs[0].size()[-2:])
-                for data_sample, pad_shape in zip(data_samples, batch_pad_shape):
-                    data_sample.set_metainfo({
+#                 print(f'data_samples:{data_samples}')
+#                 print(f'batch_pad_shape:{batch_pad_shape}')
+#                 data_samples = dict(data_samples)
+#Todo: changed data_samples
+                for data_sample, pad_shape in zip([data_samples], batch_pad_shape):
+                    data_sample = dict({'data_sample':data_sample})
+                    data_sample['metainfo'] = {
                         'batch_input_shape': batch_input_shape,
                         'pad_shape': pad_shape
-                    })
+                    }
 
                 if self.boxtype2tensor:
                     samplelist_boxtype2tensor(data_samples)
@@ -2935,7 +3232,7 @@ class YOLOv5DetDataPreprocessor(Module):
         pad_size_divisor."""
         _batch_inputs = data['inputs']
         # Process data with `pseudo_collate`.
-        if is_seq_of(_batch_inputs, jt.Var):
+        if is_seq_of(_batch_inputs, np.ndarray):
             batch_pad_shape = []
             for ori_input in _batch_inputs:
                 pad_h = int(
@@ -2946,8 +3243,14 @@ class YOLOv5DetDataPreprocessor(Module):
                             self.pad_size_divisor)) * self.pad_size_divisor
                 batch_pad_shape.append((pad_h, pad_w))
         # Process data with `default_collate`.
-        elif isinstance(_batch_inputs, jt.Var):
-            assert _batch_inputs.dim() == 4, (
+        elif isinstance(_batch_inputs, np.ndarray):
+            if _batch_inputs.ndim == 3:
+#                 _batch_inputs.reshape(1,3,3,-1)
+                run = True
+                _batch_inputs = np.expand_dims(_batch_inputs,axis=0)
+#                 print(_batch_inputs.ndim)
+#                 warnings.warn('this is compatibile for my fast test,just for test,should not appear in actual usage')
+            assert _batch_inputs.ndim == 4, (
                 'The input of `ImgDataPreprocessor` should be a NCHW tensor '
                 'or a list of tensor, but got a tensor with shape: '
                 f'{_batch_inputs.shape}')
@@ -2971,7 +3274,7 @@ class YOLOv5DetDataPreprocessor(Module):
 
 
 
-# In[17]:
+# In[19]:
 
 
 class InstanceData(BaseDataElement):
@@ -3112,12 +3415,22 @@ class InstanceData(BaseDataElement):
                               Sized), 'value must contain `__len__` attribute'
 
             if len(self) > 0:
-                assert len(value) == len(self), 'The length of '                                                 f'values {len(value)} is '                                                 'not consistent with '                                                 'the length of this '                                                 ':obj:`InstanceData` '                                                 f'{len(self)}'
+#                 assert value is np.ndarray
+                len_value = len(value)
+                if len(value) != len(self):
+                    # warnings.warn('in test,should not appear in run')
+                    len_value = len(*value)
+#                     value = *value
+#                     print(len(*value))
+#                 print(f'value:{value}')
+#                 print(len(self))
+#                 print(f'self:{self}')
+                assert  len_value == len(self), 'The length of '                                                 f'values {len(value)} is '                                                 'not consistent with '                                                 'the length of this '                                                 ':obj:`InstanceData` '                                                 f'{len(self)}'
             super().__setattr__(name, value)
 
     __setitem__ = __setattr__
 
-    def __getitem__(self, item: IndexType) -> 'InstanceData':
+    def __getitem__(self, item) -> 'InstanceData':
         """
         Args:
             item (str, int, list, :obj:`slice`, :obj:`numpy.ndarray`,
@@ -3127,7 +3440,7 @@ class InstanceData(BaseDataElement):
         Returns:
             :obj:`InstanceData`: Corresponding values.
         """
-        assert isinstance(item, IndexType.__args__)
+        # assert isinstance(item, IndexType.__args__)
         if isinstance(item, list):
             item = np.array(item)
         if isinstance(item, np.ndarray):
@@ -3151,7 +3464,7 @@ class InstanceData(BaseDataElement):
         new_data = self.__class__(metainfo=self.metainfo)
         if isinstance(item, jt.Var):
             assert item.dim() == 1, 'Only support to get the'                                     ' values along the first dimension.'
-            if isinstance(item, BoolTypeTensor.__args__):
+            if isinstance(item, jt.bool):
                 assert len(item) == len(self), 'The shape of the '                                                'input(BoolTensor) '                                                f'{len(item)} '                                                'does not match the shape '                                                'of the indexed tensor '                                                'in results_field '                                                f'{len(self)} at '                                                'first dimension.'
 
             for k, v in self.items():
@@ -3163,7 +3476,7 @@ class InstanceData(BaseDataElement):
                         v, (str, list, tuple)) or (hasattr(v, '__getitem__')
                                                    and hasattr(v, 'cat')):
                     # convert to indexes from BoolTensor
-                    if isinstance(item, BoolTypeTensor.__args__):
+                    if isinstance(item, jt.bool):
                         indexes = jt.nonzero(item).view(
                             -1).cpu().numpy().tolist()
                     else:
@@ -3257,7 +3570,7 @@ class InstanceData(BaseDataElement):
 
 
 
-# In[18]:
+# In[20]:
 
 
 class PixelData(BaseDataElement):
@@ -3386,7 +3699,7 @@ class PixelData(BaseDataElement):
 
 
 
-# In[19]:
+# In[21]:
 
 
 class DetDataSample(BaseDataElement):
@@ -3508,7 +3821,7 @@ class DetDataSample(BaseDataElement):
 
 
 
-# In[20]:
+# In[22]:
 
 
 class PackDetInputs:
@@ -3582,7 +3895,7 @@ class PackDetInputs:
             else:
                 img = to_tensor(img).permute(2, 0, 1).contiguous()
 
-            packed_results['inputs'] = img
+            packed_results['inputs'] = img.numpy()
 
         if 'gt_ignore_flags' in results:
             valid_idx = np.where(results['gt_ignore_flags'] == 0)[0]
@@ -3595,7 +3908,7 @@ class PackDetInputs:
         for key in self.mapping_table.keys():
             if key not in results:
                 continue
-            if key == 'gt_masks' or isinstance(results[key], BaseBoxes):
+            if key == 'gt_masks' or isinstance(results[key], np.ndarray):
                 if 'gt_ignore_flags' in results:
                     instance_data[
                         self.mapping_table[key]] = results[key][valid_idx]
@@ -3636,6 +3949,7 @@ class PackDetInputs:
                 img_meta[key] = results[key]
         data_sample.set_metainfo(img_meta)
         packed_results['data_samples'] = data_sample
+        # print(f'in {self.__class__}')
 
         return packed_results
 
@@ -3651,7 +3965,7 @@ class PackDetInputs:
 
 
 
-# In[21]:
+# In[23]:
 
 
 class Base_RandomFlip:
@@ -3806,6 +4120,7 @@ class Base_RandomFlip:
     def __call__(self, results: dict) -> dict:
         
         self._flip_on_direction(results)
+        # print(f'in {self.__class__}')
 
         return results
 
@@ -3823,7 +4138,7 @@ class Base_RandomFlip:
 
 
 
-# In[22]:
+# In[24]:
 
 
 class RandomFlip(Base_RandomFlip):
@@ -3911,7 +4226,8 @@ class RandomFlip(Base_RandomFlip):
 
         # flip bboxes
         if results.get('gt_bboxes', None) is not None:
-            results['gt_bboxes'].flip_(img_shape, results['flip_direction'])
+            bbox_flip(results['gt_bboxes'], img_shape, results['flip_direction'])
+#             results['gt_bboxes'].flip(img_shape, results['flip_direction'])
 
         # flip masks
         if results.get('gt_masks', None) is not None:
@@ -3933,7 +4249,7 @@ class RandomFlip(Base_RandomFlip):
 
 
 
-# In[23]:
+# In[25]:
 
 
 class Blur:
@@ -3952,7 +4268,8 @@ class Blur:
         self.params: Dict[Any, Any] = {}
         self.replay_mode = False
         self.applied_in_replay = False
-    def __call__(self, img: np.ndarray, kernel: int, **params: Any) -> np.ndarray:
+        self.py_random = random.random()
+    def __call__(self, results: dict, **params: Any) -> np.ndarray:
         """Apply blur to the input image.
 
         Args:
@@ -3964,10 +4281,23 @@ class Blur:
             np.ndarray: Blurred image.
 
         """
+        # print(f'in {self.__class__}')
+        kernel = self.get_params()
+        para = None
+        if 'img' in results:
+            img = results['img']
+            para = 'img'
+        elif 'image' in results:
+            img = results['image']
+            para = 'image'
+            # print(results)
+            # raise TypeError
         if self.random():
-            return blur(img, kernel)
+            img =  blur(img, kernel)
         else:
-            return img
+            img = img
+        results[para] = img
+        return results
     def get_params(self) -> Dict[str, Any]:
         """Get parameters for the transform.
 
@@ -3975,12 +4305,13 @@ class Blur:
             dict[str, Any]: Dictionary with parameters.
 
         """
+        self.py_random = random.random()
         kernel = sample_odd_from_range(
             self.py_random,
             self.blur_limit[0],
             self.blur_limit[1],
         )
-        return {"kernel": kernel}
+        return kernel
     def random(self):
         return random.random() < self.p
 
@@ -3991,7 +4322,7 @@ class Blur:
 
 
 
-# In[24]:
+# In[26]:
 
 
 class MedianBlur(Blur):
@@ -4001,7 +4332,7 @@ class MedianBlur(Blur):
         p: float = 0.5,
     ):
         super().__init__(blur_limit=blur_limit, p=p)
-    def apply(self, img: np.ndarray, kernel: int, **params: Any) -> np.ndarray:
+    def apply(self, results:dict, **params: Any) -> np.ndarray:
         """Apply median blur to the input image.
 
         Args:
@@ -4013,7 +4344,17 @@ class MedianBlur(Blur):
             np.ndarray: Median blurred image.
 
         """
-        return median_blur(img, kernel) if self.random() else img
+        para = None
+        if 'img' in results:
+            img = results['img']
+            para = 'img'
+        elif 'image' in results:
+            img = results['image']
+            para = 'image'
+        kernel = self.get_params()
+        img =  median_blur(img, kernel) if self.random() else img
+        results[para] = img
+        return results
 
 
 # In[ ]:
@@ -4022,7 +4363,7 @@ class MedianBlur(Blur):
 
 
 
-# In[25]:
+# In[27]:
 
 
 class ToGray:
@@ -4044,7 +4385,7 @@ class ToGray:
         self.method = method
     def random(self):
         return random.random() < self.p
-    def __call__(self, img: np.ndarray, **params: Any) -> np.ndarray:
+    def __call__(self, results:dict, **params: Any) -> np.ndarray:
         """Apply the ToGray transform to the input image.
 
         Args:
@@ -4055,7 +4396,17 @@ class ToGray:
             np.ndarray: The image with the applied ToGray transform.
 
         """
-        return to_gray(img, self.num_output_channels, self.method) if self.random() else img
+        # print(f'in {self.__class__}')
+        para = None
+        if 'img' in results:
+            img = results['img']
+            para = 'img'
+        elif 'image' in results:
+            img = results['image']
+            para = 'image'
+        img = to_gray(img, self.num_output_channels, self.method) if self.random() else img
+        results[para] = img
+        return results
 #         if is_grayscale_image(img):
 #             warnings.warn("The image is already gray.", stacklevel=2)
 #             return img
@@ -4102,7 +4453,7 @@ class ToGray:
 
 
 
-# In[26]:
+# In[28]:
 
 
 class CLAHE:
@@ -4116,8 +4467,18 @@ class CLAHE:
         self.clip_limit = cast("tuple[float, float]", clip_limit)
         self.tile_grid_size = tile_grid_size
         self.random = random.random()
-    def __call__(self, img: np.ndarray, **params: Any) -> np.ndarray:
-        return clahe(img, clip_limit, self.tile_grid_size) if self.random < self.p else img
+    def __call__(self, results: dict, **params: Any) -> np.ndarray:
+        para = None
+        if 'img' in results:
+            img = results['img']
+            para = 'img'
+        elif 'image' in results:
+            img = results['image']
+            para = 'image'
+        # print(f'in {self.__class__}')
+        img = clahe(img, self.clip_limit, self.tile_grid_size) if self.random < self.p else img
+        results[para] = img
+        return results
 
 
 # In[ ]:
@@ -4126,7 +4487,7 @@ class CLAHE:
 
 
 
-# In[27]:
+# In[29]:
 
 
 class BboxParams:
@@ -4285,7 +4646,7 @@ class BboxParams:
 
 
 
-# In[28]:
+# In[30]:
 
 
 class EMA(Module):
@@ -4298,16 +4659,19 @@ class EMA(Module):
         update_buffers: bool = False
     ):
         super().__init__()
-#         self.module = deepcopy(model).need_grad_(False)
-        self.module = module.clone().need_grad_(False)
-        self.interval = interval
-        self.register_buffer('steps',
-                             jt.array(0))
-        self.update_buffers = update_buffers
-        if update_buffers:
-            self.avg_parameters = self.module.state_dict()
-        else:
-            self.avg_parameters = dict(self.module.named_parameters())
+        with jt.no_grad():
+            self.gamma = gamma
+            self.momentum = momentum
+            self.module = deepcopy(model)
+            # self.module = module.clone().need_grad_(False)
+            self.interval = interval
+            self.register_buffer('steps',
+                                 jt.array(0))
+            self.update_buffers = update_buffers
+            if update_buffers:
+                self.avg_parameters = self.module.state_dict()
+            else:
+                self.avg_parameters = dict(self.module.named_parameters())
     def execute(self, *args, **kwargs):
         """Forward method of the averaged model."""
         return self.module(*args, **kwargs)
@@ -4323,20 +4687,29 @@ class EMA(Module):
             dict(model.named_parameters()))
         if self.steps == 0:
             for k, p_avg in self.avg_parameters.items():
-                p_avg.data.copy_(src_parameters[k].data)
+                # print(f'type(src_parameters[k].data):{type(src_parameters[k].data)}')
+                # print(f'type(p_avg.data):{type(p_avg.data)}')
+                src_parameters[k].data = p_avg.data.copy()
         elif self.steps % self.interval == 0:
             for k, p_avg in self.avg_parameters.items():
                 if p_avg.dtype.is_floating_point:
-                    device = p_avg.device
+#                     device = p_avg.device
+                    device = _device
                     self.avg_func(p_avg.data,
-                                  src_parameters[k].data.to(device),
+                    src_parameters[k].data,
+                                  # src_parameters[k].data.to(device),
                                   self.steps)
 
         if not self.update_buffers:
             # If not update the buffers,
             # keep the buffers in sync with the source model.
-            for b_avg, b_src in zip(self.module.buffers(), model.buffers()):
-                b_avg.data.copy_(b_src.data.to(b_avg.device))
+            for b_avg, b_src in zip(self.module.parameters(), model.parameters()):
+#                 b_avg.data.copy(b_src.data.to(b_avg.device))
+#                 b_src.data = jt.copy(b_avg.data)
+#                 b_src.data = jt.array(b_src.data)
+                x = b_avg.data.copy()
+                # print(f'type(b_src.data):{type(b_src.data)}')
+                jt.array(b_src.data).assign(x)
         self.steps += 1
     def avg_func(self, averaged_param: jt.Var, source_param: jt.Var,
                  steps: int) -> None:
@@ -4360,7 +4733,7 @@ class EMA(Module):
 
 
 
-# In[29]:
+# In[31]:
 
 
 class LabelEncoder:
@@ -4455,6 +4828,7 @@ class LabelEncoder:
         # If input is empty, default to non-numerical to allow potential updates later
         if not y:
             self.is_numerical = False
+            raise TypeError
             return self
 
         self.is_numerical = all(isinstance(label, Real) for label in y)
@@ -4463,11 +4837,14 @@ class LabelEncoder:
             return self
 
         unique_labels = sorted(set(y), key=self.custom_sort)
+        # print(f'unique_labels:{unique_labels}')
+        raise TypeError
         for label in unique_labels:
             if label not in self.classes_:
                 self.classes_[label] = self.num_classes
                 self.inverse_classes_[self.num_classes] = label
                 self.num_classes += 1
+        # print(f'fit:{y}')
         return self
     def transform(self, y: Union[Sequence[Any], np.ndarray]) -> np.ndarray:
         """Transform labels to encoded integer indices.
@@ -4484,7 +4861,8 @@ class LabelEncoder:
 
         if self.is_numerical:
             return np.array(y)
-
+        # print(f'in transform y : {y}')
+        # print(f'np.array([self.classes_[label] for label in y]) : {np.array([self.classes_[label] for label in y])}')
         return np.array([self.classes_[label] for label in y])
     def custom_sort(item: Any) -> Tuple[int, Union[Real, str]]:
         """Sort items by type then value for consistent label ordering.
@@ -4502,6 +4880,19 @@ class LabelEncoder:
 
         """
         return (0, item) if isinstance(item, Real) else (1, str(item))
+    def fit_transform(self, y: Union[Sequence[Any], np.ndarray]) -> np.ndarray:
+        """Fit the encoder and transform the input labels in one step.
+
+        Args:
+            y (Sequence[Any] | np.ndarray): Input labels to fit and transform.
+
+        Returns:
+            np.ndarray: Encoded integer indices.
+
+        """
+        self.fit(y)
+
+        return self.transform(y)
 
 
 # In[ ]:
@@ -4510,7 +4901,7 @@ class LabelEncoder:
 
 
 
-# In[30]:
+# In[32]:
 
 
 @dataclass
@@ -4529,7 +4920,7 @@ class LabelMetadata:
 
 
 
-# In[31]:
+# In[33]:
 
 
 class LabelManager:
@@ -4598,15 +4989,19 @@ class LabelManager:
         return decoded_data.tolist()
     def _encode_data(self, field_data: Any, metadata: LabelMetadata) -> np.ndarray:
         """Encode field data for processing."""
+        # print(f'in _encode_data')
         if metadata.is_numerical:
             # For numerical values, convert to float32 for processing
             if isinstance(field_data, np.ndarray):
+                # print(f'field_data1:{field_data}')
                 return field_data.reshape(-1, 1).astype(np.float32)
+            # print(f'field_data2:{field_data}')
             return np.array(field_data, dtype=np.float32).reshape(-1, 1)
 
         # For non-numerical values, use LabelEncoder
         if metadata.encoder is None:
             raise ValueError("Encoder not initialized for non-numerical data")
+        # print(f'field_data:{field_data}')
         return metadata.encoder.fit_transform(field_data).reshape(-1, 1)
     def _analyze_input(self, field_data: Any) -> LabelMetadata:
         """Analyze input data and create metadata."""
@@ -4642,14 +5037,14 @@ class LabelManager:
 
 
 
-# In[32]:
+# In[34]:
 
 
 class BboxProcessor:
     ShapeType = Dict[Literal["depth", "height", "width"], int]
     def __init__(self, params: BboxParams, additional_targets: Union[Dict[str, str], None] = None):
         self.params = params
-        self.data_fields = [self.default_data_name]
+        self.data_fields = [self.default_data_name()]
         self.is_sequence_input: dict[str, bool] = {}
         self.label_manager = LabelManager()
         assert additional_targets is None
@@ -4676,6 +5071,8 @@ class BboxProcessor:
 
         """
         if self.params.label_fields and not all(i in data for i in self.params.label_fields):
+            # print(data)
+            # print(self.params.label_fields)
             msg = "Your 'label_fields' are not valid - them must have same names as params in dict"
             raise ValueError(msg)
     def preprocess(self, data: Dict[str, Any]) -> None:
@@ -4686,16 +5083,22 @@ class BboxProcessor:
 
         """
         shape = get_shape(data)
-
+        # print(f'in preprocess data: {data}')
         for data_name in set(self.data_fields) & set(data.keys()):  # Convert list of lists to numpy array if necessary
             if isinstance(data[data_name], Sequence):
+                # print(print(f'data[{data_name}]: {data[data_name]}'))
                 self.is_sequence_input[data_name] = True
                 data[data_name] = np.array(data[data_name], dtype=np.float32)
+                # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
             else:
                 self.is_sequence_input[data_name] = False
-
+                # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
+        # raise NotImplementedError()
         data = self.add_label_fields_to_data(data)
+        # print(f'after data: {data}')
         for data_name in set(self.data_fields) & set(data.keys()):
+            # print(f'data[data_name]: {data[data_name]}')
+            # raise NotImplementedError()
             data[data_name] = self.check_and_convert(data[data_name], shape, direction="to")
     def add_label_fields_to_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Add label fields to data arrays.
@@ -4709,14 +5112,20 @@ class BboxProcessor:
             dict[str, Any]: Data with label fields added.
 
         """
+        # print('in add_label_fields_to_data')
         if not self.params.label_fields:
+            # print('out 1')
             return data
-
+        # print(set(data.keys()))
+        # print(f'set(self.data_fields): {set(self.data_fields)}')
         for data_name in set(self.data_fields) & set(data.keys()):
             if not data[data_name].size:
+                # print(f'data[data_name].size :{data[data_name].size}')
                 continue
             data_array = data[data_name]
+            # print(f'data_array.shape :{data_array.shape}')
             if self.params.label_fields is not None:
+                # print(f'self.params.label_fields: {self.params.label_fields}')
                 for label_field in self.params.label_fields:
                     if len(data[data_name]) != len(data[label_field]):
                         raise ValueError(
@@ -4724,9 +5133,13 @@ class BboxProcessor:
                             f"Got {len(data[data_name])} and {len(data[label_field])} respectively.",
                                 )
                     encoded_labels = self.label_manager.process_field(data_name, label_field, data[label_field])
+                    # print(f'data_array:{data_array}')
                     data_array = np.hstack((data_array, encoded_labels))
+                    # print(f'data_array:{data_array}')
                     del data[label_field]
                     data[data_name] = data_array
+                    # print(f'data[{data_name}]:{data}')
+                # raise TypeError('test')
                 return data
     def check_and_convert(
         self,
@@ -4760,23 +5173,30 @@ class BboxProcessor:
 
         """
         if direction == "to":
+            # raise NotImplementedError
             # First convert to albumentations format
             if self.params.format == "albumentations":
+                # raise NotImplementedError()
                 converted_data = data
             else:
-                converted_data = convert_bboxes_to_albumentations(
+                converted_data = self.__class__.convert_bboxes_to_albumentations(
                     data,
                     self.params.format,
                     shape,
                     check_validity=False,  # Don't check validity yet
                 )
+                # raise NotImplementedError()
+                # print(f'converted data: {converted_data}')
 
             if self.params.clip and converted_data.size > 0:
+                # raise NotImplementedError('in clip')
                 converted_data[:, :4] = np.clip(converted_data[:, :4], 0, 1)
+                # print(f'converted_data:{converted_data}')
 
             # Then filter invalid boxes if requested
             if self.params.filter_invalid_bboxes:
-                converted_data = filter_bboxes(
+                # raise NotImplementedError('in filter')
+                converted_data = self.__class__.filter_bboxes(
                     converted_data,
                     shape,
                     min_area=0,
@@ -4786,14 +5206,16 @@ class BboxProcessor:
                 )
 
             # Finally check the remaining boxes
-            self.check_bboxes(converted_data, shape)
+            # raise TypeError('should filter')
+            self.__class__.check_bboxes(converted_data, shape)
             return converted_data
         self.check_bboxes(data, shape)
         if self.params.format == "albumentations":
             return data
-        return convert_bboxes_from_albumentations(data, self.params.format, shape)
+        return __class__.convert_bboxes_from_albumentations(data, self.params.format, shape)
+    @staticmethod
     def check_bboxes(bboxes: np.ndarray, shape=None) -> None:
-        
+
         """Check if bounding boxes are valid.
 
         Args:
@@ -4804,16 +5226,24 @@ class BboxProcessor:
 
         """
         # Check if all values are in range [0, 1]
+        # print(f'bboxes:{bboxes}')
         in_range = (bboxes[:, :4] >= 0) & (bboxes[:, :4] <= 1)
+        # print(f'in_range:{in_range}')
         close_to_zero = np.isclose(bboxes[:, :4], 0)
+        # print(f'close_to_zero:{close_to_zero}')
         close_to_one = np.isclose(bboxes[:, :4], 1)
+        # print(f'close_to_one:{close_to_one}')
         valid_range = in_range | close_to_zero | close_to_one
-
+        # print(f'valid_range:{valid_range}')
         if not np.all(valid_range):
             invalid_idx = np.where(~np.all(valid_range, axis=1))[0][0]
+            # print(f'invalid_idx: {invalid_idx}')
             invalid_bbox = bboxes[invalid_idx]
+            # print(f'invalid_bbox : {invalid_bbox}')
             invalid_coord = ["x_min", "y_min", "x_max", "y_max"][np.where(~valid_range[invalid_idx])[0][0]]
+            # print(f'invalid_coord: {invalid_coord}')
             invalid_value = invalid_bbox[np.where(~valid_range[invalid_idx])[0][0]]
+            # print(f'invalid_value: {invalid_value}')
             raise ValueError(
                 f"Expected {invalid_coord} for bbox {invalid_bbox} to be in the range [0.0, 1.0], got {invalid_value}.",
             )
@@ -4840,7 +5270,7 @@ class BboxProcessor:
 
         """
         return np.array(
-            convert_bboxes_from_albumentations(data, self.params.format, shape, check_validity=True),
+            self.__class__.convert_bboxes_from_albumentations(data, self.params.format, shape, check_validity=True),
             dtype=data.dtype,
         )
 
@@ -4856,12 +5286,13 @@ class BboxProcessor:
 
         """
         if self.params.clip:
-            data_np = convert_bboxes_to_albumentations(data, self.params.format, shape, check_validity=False)
-            data_np = filter_bboxes(data_np, shape, min_area=0, min_visibility=0, min_width=0, min_height=0)
-            check_bboxes(data_np)
+            data_np = self.__class__.convert_bboxes_to_albumentations(data, self.params.format, shape, check_validity=False)
+            data_np = self.__class__.filter_bboxes(data_np, shape, min_area=0, min_visibility=0, min_width=0, min_height=0)
+            self.__class__.check_bboxes(data_np)
             return data_np
 
-        return convert_bboxes_to_albumentations(data, self.params.format, shape, check_validity=True)
+        return self.__class__.convert_bboxes_to_albumentations(data, self.params.format, shape, check_validity=True)
+    @staticmethod
     def filter_bboxes(
     bboxes: np.ndarray,
     shape: ShapeType,
@@ -4871,7 +5302,7 @@ class BboxProcessor:
     min_height: float = 1.0,
     max_accept_ratio: Union[float, None] = None,
     ) -> np.ndarray:
-        
+
         """Remove bounding boxes that either lie outside of the visible area by more than min_visibility
         or whose area in pixels is under the threshold set by `min_area`. Also crops boxes to final image size.
 
@@ -4897,16 +5328,17 @@ class BboxProcessor:
             return np.array([], dtype=np.float32).reshape(0, 4)
 
         # Calculate areas of bounding boxes before clipping in pixels
-        denormalized_box_areas = calculate_bbox_areas_in_pixels(bboxes, shape)
+        denormalized_box_areas = BboxProcessor.calculate_bbox_areas_in_pixels(bboxes, shape)
+        #todo and find how the bboxes clipped(should be in [0,1]
 
         # Clip bounding boxes in ratio
-        clipped_bboxes = clip_bboxes(bboxes, shape)
+        clipped_bboxes = BboxProcessor.clip_bboxes(bboxes, shape)
 
         # Calculate areas of clipped bounding boxes in pixels
-        clipped_box_areas = calculate_bbox_areas_in_pixels(clipped_bboxes, shape)
+        clipped_box_areas = BboxProcessor.calculate_bbox_areas_in_pixels(clipped_bboxes, shape)
 
         # Calculate width and height of the clipped bounding boxes
-        denormalized_bboxes = denormalize_bboxes(clipped_bboxes[:, :4], shape)
+        denormalized_bboxes = BboxProcessor.denormalize_bboxes(clipped_bboxes[:, :4], shape)
 
         clipped_widths = denormalized_bboxes[:, 2] - denormalized_bboxes[:, 0]
         clipped_heights = denormalized_bboxes[:, 3] - denormalized_bboxes[:, 1]
@@ -4947,7 +5379,7 @@ class BboxProcessor:
 
         """
         self.params: BboxParams
-        return filter_bboxes(
+        return self.__class__.filter_bboxes(
             data,
             shape,
             min_area=self.params.min_area,
@@ -4956,6 +5388,7 @@ class BboxProcessor:
             min_height=self.params.min_height,
             max_accept_ratio=self.params.max_accept_ratio,
         )
+    @staticmethod
     def normalize_bboxes(bboxes: np.ndarray, shape: Union[ShapeType, Tuple[int, int]]) -> np.ndarray:
         """Normalize array of bounding boxes.
 
@@ -4971,11 +5404,13 @@ class BboxProcessor:
             rows, cols = shape[:2]
         else:
             rows, cols = shape["height"], shape["width"]
-
+        # print(f' rows, cols:{ rows, cols}')
+        # print(bboxes)
         normalized = bboxes.copy().astype(float)
         normalized[:, [0, 2]] /= cols
         normalized[:, [1, 3]] /= rows
         return normalized
+    @staticmethod
     def denormalize_bboxes(
     bboxes: np.ndarray,
     shape:Union[ShapeType, Tuple[int, int]],
@@ -4994,6 +5429,7 @@ class BboxProcessor:
 
         # Vectorized scaling of bbox coordinates
         return bboxes * np.array([*scale_factors, *scale_factors, *[1] * (bboxes.shape[1] - 4)], dtype=float)
+    @staticmethod
     def convert_bboxes_to_albumentations(
         bboxes: np.ndarray,
         source_format: Literal["coco", "pascal_voc", "yolo"],
@@ -5024,8 +5460,10 @@ class BboxProcessor:
             )
 
         bboxes = bboxes.copy().astype(np.float32)
+        # print(f'in convert_bboxes_to_albumentations bboxes:{bboxes}')
         converted_bboxes = np.zeros_like(bboxes)
         converted_bboxes[:, 4:] = bboxes[:, 4:]  # Preserve additional columns
+        # print(f'converted_bboxes[:, 4:]: {converted_bboxes[:, 4:]}')
 
         if source_format == "coco":
             converted_bboxes[:, 0] = bboxes[:, 0]  # x_min
@@ -5043,14 +5481,57 @@ class BboxProcessor:
             converted_bboxes[:, 3] = bboxes[:, 1] + h_half  # y_max
         else:  # pascal_voc
             converted_bboxes[:, :4] = bboxes[:, :4]
-
+        # print(f'converted_bboxes[:, :4]:{converted_bboxes[:, :4]}')
         if source_format != "yolo":
-            converted_bboxes[:, :4] = normalize_bboxes(converted_bboxes[:, :4], shape)
+            converted_bboxes[:, :4] = BboxProcessor.normalize_bboxes(converted_bboxes[:, :4], shape)
 
         if check_validity:
-            check_bboxes(converted_bboxes)
+            BboxProcessor.check_bboxes(converted_bboxes)
 
         return converted_bboxes
+    @staticmethod
+    def calculate_bbox_areas_in_pixels(bboxes: np.ndarray, shape: ShapeType) -> np.ndarray:
+        """Calculate areas for multiple bounding boxes.
+        This function computes the areas of bounding boxes given their normalized coordinates
+        and the dimensions of the image they belong to. The bounding boxes are expected to be
+        in the format [x_min, y_min, x_max, y_max] with normalized coordinates (0 to 1).
+
+        Args:
+            bboxes (np.ndarray): A numpy array of shape (N, 4+) where N is the number of bounding boxes.
+                                 Each row contains [x_min, y_min, x_max, y_max] in normalized coordinates.
+                                 Additional columns beyond the first 4 are ignored.
+            shape (ShapeType): A tuple containing the height and width of the image (height, width).
+
+        Returns:
+            np.ndarray: A 1D numpy array of shape (N,) containing the areas of the bounding boxes in pixels.
+                        Returns an empty array if the input `bboxes` is empty.
+
+        Note:
+            - The function assumes that the input bounding boxes are valid (i.e., x_max > x_min and y_max > y_min).
+              Invalid bounding boxes may result in negative areas.
+            - The function preserves the input array and creates a copy for internal calculations.
+            - The returned areas are in pixel units, not normalized.
+
+        Examples:
+            >>> bboxes = np.array([[0.1, 0.1, 0.5, 0.5], [0.2, 0.2, 0.8, 0.8]])
+            >>> image_shape = (100, 100)
+            >>> areas = calculate_bbox_areas(bboxes, image_shape)
+            >>> print(areas)
+            [1600. 3600.]
+
+        """
+        if len(bboxes) == 0:
+            return np.array([], dtype=np.float32)
+
+        # Unpack shape to variables
+        height, width = shape["height"], shape["width"]
+
+        # Directly compute denormalized bbox dimensions and areas
+        widths = (bboxes[:, 2] - bboxes[:, 0]) * width
+        heights = (bboxes[:, 3] - bboxes[:, 1]) * height
+
+        return widths * heights
+    @staticmethod
     def convert_bboxes_from_albumentations(
     bboxes: np.ndarray,
     target_format: Literal["coco", "pascal_voc", "yolo"],
@@ -5079,12 +5560,12 @@ class BboxProcessor:
             )
 
         if check_validity:
-            check_bboxes(bboxes)
+            BboxProcessor.check_bboxes(bboxes)
 
         converted_bboxes = np.zeros_like(bboxes)
         converted_bboxes[:, 4:] = bboxes[:, 4:]  # Preserve additional columns
 
-        denormalized_bboxes = denormalize_bboxes(bboxes[:, :4], shape) if target_format != "yolo" else bboxes[:, :4]
+        denormalized_bboxes = BboxProcessor.denormalize_bboxes(bboxes[:, :4], shape) if target_format != "yolo" else bboxes[:, :4]
 
         if target_format == "coco":
             converted_bboxes[:, 0] = denormalized_bboxes[:, 0]  # x_min
@@ -5100,6 +5581,7 @@ class BboxProcessor:
             converted_bboxes[:, :4] = denormalized_bboxes
 
         return converted_bboxes
+    @staticmethod
     def clip_bboxes(bboxes: np.ndarray, shape: ShapeType) -> np.ndarray:
         """Clip bounding boxes to the image shape.
 
@@ -5116,7 +5598,7 @@ class BboxProcessor:
         height, width = shape["height"], shape["width"]
 
             # Denormalize bboxes
-        denorm_bboxes = denormalize_bboxes(bboxes, shape)
+        denorm_bboxes = BboxProcessor.denormalize_bboxes(bboxes, shape)
 
     ## Note:
     # It could be tempting to use cols - 1 and rows - 1 as the upper bounds for the clipping
@@ -5139,7 +5621,7 @@ class BboxProcessor:
         denorm_bboxes[:, [1, 3]] = np.clip(denorm_bboxes[:, [1, 3]], 0, height, out=denorm_bboxes[:, [1, 3]])
 
             # Normalize clipped bboxes
-        return normalize_bboxes(denorm_bboxes, shape)
+        return BboxProcessor.normalize_bboxes(denorm_bboxes, shape)
     def postprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Process data after transformation.
 
@@ -5157,7 +5639,7 @@ class BboxProcessor:
     def _process_data_fields(self, data: Dict[str, Any], shape: ShapeType) -> Dict[str, Any]:
         for data_name in set(self.data_fields) & set(data.keys()):
             field_data = self.filter(data[data_name], shape)
-            data[data_name] = check_and_convert(field_data, shape, direction="from")
+            data[data_name] = self.check_and_convert(field_data, shape, direction="from")
         return data
     def remove_label_fields_from_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Remove label fields from data arrays and restore them as separate entries.
@@ -5193,6 +5675,11 @@ class BboxProcessor:
             data[data_name] = data_array[:, :non_label_columns]
 
         return data
+    def _convert_sequence_inputs(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        for data_name in set(self.data_fields) & set(data.keys()):
+            if self.is_sequence_input.get(data_name, False):
+                data[data_name] = data[data_name].tolist()
+        return data
 
 
 # In[ ]:
@@ -5201,24 +5688,11 @@ class BboxProcessor:
 
 
 
-# In[ ]:
+# In[35]:
 
 
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[33]:
-
-
-class Compose:
-    AVAILABLE_KEYS = ("image", "mask", "masks", "bboxes", "keypoints", "volume", "volumes", "mask3d", "masks3d")
-    MASK_KEYS = (
+AVAILABLE_KEYS = ("image", "mask", "masks", "bboxes", "keypoints", "volume", "volumes", "mask3d", "masks3d")
+MASK_KEYS = (
     "mask",  # 2D mask
     "masks",  # Multiple 2D masks
     "mask3d",  # 3D mask
@@ -5226,16 +5700,29 @@ class Compose:
     )
 
     # Keys related to image data
-    IMAGE_KEYS = {"image", "images"}
-    CHECKED_SINGLE = {"image", "mask"}
-    CHECKED_MULTI = {"masks", "images", "volumes", "masks3d"}
-    CHECK_BBOX_PARAM = {"bboxes"}
-    CHECK_KEYPOINTS_PARAM = {"keypoints"}
-    VOLUME_KEYS = {"volume", "volumes"}
-    CHECKED_VOLUME = {"volume"}
-    CHECKED_VOLUMES = {"volumes"}
-    CHECKED_MASK3D = {"mask3d"}
-    CHECKED_MASKS3D = {"masks3d"}
+IMAGE_KEYS = {"image", "images"}
+CHECKED_SINGLE = {"image", "mask"}
+CHECKED_MULTI = {"masks", "images", "volumes", "masks3d"}
+CHECK_BBOX_PARAM = {"bboxes"}
+CHECK_KEYPOINTS_PARAM = {"keypoints"}
+VOLUME_KEYS = {"volume", "volumes"}
+CHECKED_VOLUME = {"volume"}
+CHECKED_VOLUMES = {"volumes"}
+CHECKED_MASK3D = {"mask3d"}
+CHECKED_MASKS3D = {"masks3d"}
+
+
+# In[ ]:
+
+
+
+
+
+# In[36]:
+
+
+class Compose:
+
     def __init__(
         self,
         transforms,
@@ -5327,11 +5814,15 @@ class Compose:
         """
         # Check and sync worker seed if needed
 #         self._check_worker_seed()
-
+#         a = False
         if args:
             msg = "You have to pass data to augmentations as named arguments, for example: aug(image=image)"
+            # print(msg)
+            # a = True
+            # print(*args)
+            # # print(arg)
             raise KeyError(msg)
-
+        data = data['data'] if 'data' in data else data
         # Initialize applied_transforms only in top-level Compose if requested
         if self.save_applied_params and self.main_compose:
             data["applied_transforms"] = []
@@ -5341,11 +5832,34 @@ class Compose:
             return data
 
         self.preprocess(data)
+        # i = 0
 
         for t in self.transforms:
-            data = t(**data)
+            # print(f'in {self.__class__}')
+            # print(f'data:{(**data)}')
+            # data = {**data}
+            # print(f'data:{data}')
+            # print(data['data'])
+            # data = data['data'] if 'data' in data else data
+            # if not i:
+            #     data = t(results = data['data'])
+            # else:
+            #     data = t(results = data)
+            # bbox = data.get("bbox", None)
+            # print(f'data.bbox:{bbox}')
+            # print(f'data:{data}')
+            if t.__class__ is type:
+                continue
+#             print(f'will in {t.__class__}')
+            data = t(results = data)
+            # print(data.get('img',data))
+            # if not a:
+            #     data = t(**data)
+            # else:
+            #     data = t(**args)
             self._track_transform_params(t, data)
             data = self.check_data_post_transform(data)
+            # i = 1
 
         return self.postprocess(data)
     def preprocess(self, data: Any) -> None:
@@ -5364,7 +5878,7 @@ class Compose:
 
                 shape = self._get_data_shape(data_name, internal_name, data_value)
                 if shape is not None:
-                    if internal_name in Union[CHECKED_VOLUME, CHECKED_MASK3D]:
+                    if internal_name in [CHECKED_VOLUME, CHECKED_MASK3D]:
                         shapes.append(shape[1:3])  # H,W from (D,H,W)
                         volume_shapes.append(shape[:3])  # D,H,W
                     elif internal_name in {"volumes", "masks3d"}:
@@ -5412,6 +5926,7 @@ class Compose:
         if not self.main_compose:
             return
         for processor in self.processors.values():
+            # print(f'data : {data}')
             processor.ensure_data_valid(data)
         for processor in self.processors.values():
             processor.preprocess(data)
@@ -5439,16 +5954,16 @@ class Compose:
             Dict[str, Any]: Post-processed data.
 
         """
-#         if self.main_compose:
-#             for p in self.processors.values():
-#                 p.postprocess(data)
+        if self.main_compose:
+            for p in self.processors.values():
+                p.postprocess(data)
 
-#             # Convert back to list if original input was a list
-#             if "images" in data and self._images_was_list:
-#                 data["images"] = list(data["images"])
+            # Convert back to list if original input was a list
+            if "images" in data and self._images_was_list:
+                data["images"] = list(data["images"])
 
-#             if "masks" in data and self._masks_was_list:
-#                 data["masks"] = list(data["masks"])
+            if "masks" in data and self._masks_was_list:
+                data["masks"] = list(data["masks"])
 
         return data
     def _track_transform_params(self, transform, data: Dict[str, Any]) -> None:
@@ -5477,7 +5992,7 @@ class Compose:
         return data
 
 
-# In[34]:
+# In[37]:
 
 
 #support albumentations class
@@ -5494,7 +6009,7 @@ albumentations = {'blur':Blur,
 } 
 
 
-# In[35]:
+# In[38]:
 
 
 class YOLOv5CocoDataset(Dataset):
@@ -5584,7 +6099,6 @@ class YOLOv5CocoDataset(Dataset):
             batch_size = batch_size
             # persistent_workers = persistent_workers
         )
-        #jump
         # print(f'batch_size {self.batch_size}')
         msg = 'due to my energy is limited some function not supported'
         assert batch_shapes_cfg is None, msg
@@ -5594,6 +6108,7 @@ class YOLOv5CocoDataset(Dataset):
         self.backend_args = backend_args
         self.return_classes = return_classes
         self.caption_prompt = caption_prompt
+        self.collate_fn = collate_fn
         if self.caption_prompt is not None:
             assert self.return_classes,                 'return_classes must be True when using caption_prompt'
         if file_client_args is not None:
@@ -5625,7 +6140,6 @@ class YOLOv5CocoDataset(Dataset):
         # Full initialize the dataset.
         if not lazy_init:
             self.full_init()
-#jump
     @property
     def metainfo(self) -> dict:
         """Get meta information of dataset.
@@ -5662,7 +6176,7 @@ class YOLOv5CocoDataset(Dataset):
                 try:
                     cls_metainfo[k] = list_from_file(v)
                 except (TypeError, FileNotFoundError):
-                    warning(
+                    warnings.warn(
                         f'{v} is not a meta file, simply parsed as meta '
                         'information'
                     )
@@ -5748,10 +6262,10 @@ class YOLOv5CocoDataset(Dataset):
         if self.test_mode is False:
             data_info = self.get_data_info(idx)
             data_info['dataset'] = self
-            return self.pipeline(data_info)
+            return self.pipeline(data = data_info)
         else:
             data_info = self.get_data_info(idx)
-            return self.pipeline(data_info)
+            return self.pipeline(data = data_info)
 #             return super().prepare_data(idx)
     def __len__(self) -> int:
         """Get the length of filtered dataset and automatically call
@@ -5945,7 +6459,9 @@ class YOLOv5CocoDataset(Dataset):
             if data is None:
                 idx = self._rand_another()
                 continue
-            return  collate_fn(data)
+#             print(data)
+#             print(self.collate_fn(data))
+            return  data
         raise Exception(f'Cannot find valid image after {self.max_refetch}! '
                         'Please check your image path and pipeline')
     def filter_data(self) -> List[dict]:
@@ -6021,7 +6537,7 @@ class YOLOv5CocoDataset(Dataset):
 
 
 
-# In[36]:
+# In[39]:
 
 
 class Albu:
@@ -6085,7 +6601,8 @@ class Albu:
                  transforms: List[dict],
                  bbox_params: Optional[dict] = None,
                  keymap: Optional[dict] = None,
-                 skip_img_without_anno: bool = False) -> None:
+                 skip_img_without_anno: bool = False,
+                 ) -> None:
 #         if Compose is None:
 #             raise RuntimeError('albumentations is not installed')
 
@@ -6150,6 +6667,7 @@ class Albu:
         assert isinstance(cfg, dict) and 'type' in cfg
         args = cfg.copy()
         obj_type = args.pop('type')
+        # print(f'obj_type:{obj_type}')
 #         assert obj_type ==
 #         assert isinstance(obj_type,str)
         if isinstance(obj_type,str):
@@ -6164,6 +6682,7 @@ class Albu:
                 f'type must be a str or valid type, but got {type(obj_type)}')
 
         if 'transforms' in args:
+
             args['transforms'] = [
                 self.albu_builder(transform)
                 for transform in args['transforms']
@@ -6195,13 +6714,19 @@ class Albu:
         # dict to albumentations format
         results = self.mapper(results, self.keymap_to_albu)
         results, ori_masks = self._preprocess_results(results)
-        results = self.aug(**results)
+        # print('in albu')
+        # data = {**results}
+        # print(f'data : {results}')
+        # raise TypeError
+        results = self.aug(data = results)
+        # print(f'results : {results}')
         results = self._postprocess_results(results, ori_masks)
         if results is None:
             return None
         # back to the original format
         results = self.mapper(results, self.keymap_back)
         results['img_shape'] = results['img'].shape[:2]
+        # print(f'in {self.__class__}')
         return results
 
     def _preprocess_results(self, results: dict) -> tuple:
@@ -6291,7 +6816,7 @@ class Albu:
 
 
 
-# In[37]:
+# In[40]:
 
 
 class LetterResize:
@@ -6420,10 +6945,10 @@ class LetterResize:
 
         if image_shape != no_pad_shape:
             # compare with no resize and padding size
-            image = (transform.resize(
+            image = imresize(
                 img = image, size = (no_pad_shape[0], no_pad_shape[1]),
                 interpolation=self.interpolation,
-                )).numpy()
+                )
 
         scale_factor = (no_pad_shape[1] / image_shape[1],
                         no_pad_shape[0] / image_shape[0])
@@ -6474,16 +6999,16 @@ class LetterResize:
             return
 
         gt_masks = results['gt_masks']
-        assert isinstance(
-            gt_masks, PolygonMasks
-        ), f'Only supports PolygonMasks, but got {type(gt_masks)}'
+        # assert isinstance(
+        #     gt_masks, PolygonMasks
+        # ), f'Only supports PolygonMasks, but got {type(gt_masks)}'
 
         # resize the gt_masks
         gt_mask_h = results['gt_masks'].height * results['scale_factor'][1]
         gt_mask_w = results['gt_masks'].width * results['scale_factor'][0]
-        gt_masks = transform.resize(img = results['gt_masks'],
-            shape = (int(round(gt_mask_h)), int(round(gt_mask_w))))
-        gt_masks.numpy()
+        gt_masks = imresize(img = results['gt_masks'],
+            size = (int(round(gt_mask_h)), int(round(gt_mask_w))))
+        # gt_masks.numpy()
         top_padding, _, left_padding, _ = results['pad_param']
         if int(left_padding) != 0:
             gt_masks = mask_translate(gt_masks,
@@ -6505,14 +7030,23 @@ class LetterResize:
 
         if len(results['pad_param']) != 4:
             return
-        bbox.translate(results['gt_bboxes'],
+        bbox_translate(results['gt_bboxes'],
             (results['pad_param'][2], results['pad_param'][0]))
 
         if self.clip_object_border:
-            bbox.clip(results['gt_bboxes'], (results['img_shape'][1],results['img_shape'][0]))
+            bbox_clip(results['gt_bboxes'], (results['img_shape'][1],results['img_shape'][0]))
 
     def __call__(self, results: dict) -> dict:
-        results = super().transform(results)
+        if self.scale:
+            results['scale'] = self.scale
+        else:
+            img_shape = results['img'].shape[:2]
+            results['scale'] = _scale_size(img_shape[::-1], self.scale_factor)
+        self._resize_img(results)
+        self._resize_bboxes(results)
+        self._resize_masks(results)
+        self._resize_seg(results)
+        self._record_homography_matrix(results)
         if 'scale_factor_origin' in results:
             scale_factor_origin = results.pop('scale_factor_origin')
             results['scale_factor'] = (results['scale_factor'][0] *
@@ -6522,7 +7056,44 @@ class LetterResize:
         if 'pad_param_origin' in results:
             pad_param_origin = results.pop('pad_param_origin')
             results['pad_param'] += pad_param_origin
+        # print(f'in {self.__class__}')
         return results
+    def _resize_seg(self, results: dict) -> None:
+        """Resize semantic segmentation map with ``results['scale']``."""
+        if results.get('gt_seg_map', None) is not None:
+            if self.keep_ratio:
+#                 gt_seg = mmcv.imrescale(
+#                     results['gt_seg_map'],
+#                     results['scale'],
+#                     interpolation='nearest',
+#                     backend=self.backend)
+                gt_seg = imrescale(
+                    img = results['gt_seg_map'],
+                    size = results['scale'],
+                    interpolation='nearest',
+                )
+            else:
+                gt_seg = imresize(
+                    results['gt_seg_map'],
+                    results['scale'],
+                    interpolation='nearest',
+                    backend=self.backend)
+#                 gt_seg = (transform.resize(
+#                     img = results['gt_seg_map'],
+#                     size = (results['scale'][1],results['scale'][0]), #change
+#                     interpolation='nearest',
+#                 )).numpy()
+            results['gt_seg_map'] = gt_seg
+    def _record_homography_matrix(self, results: dict) -> None:
+        """Record the homography matrix for the Resize."""
+        w_scale, h_scale = results['scale_factor'] # TODO1 scale_factor in results should be w,h, some origin code use hw,see if need change
+        homography_matrix = np.array(
+            [[w_scale, 0, 0], [0, h_scale, 0], [0, 0, 1]], dtype=np.float32)
+        if results.get('homography_matrix', None) is None:
+            results['homography_matrix'] = homography_matrix
+        else:
+            results['homography_matrix'] = homography_matrix @ results[
+                'homography_matrix']
 
 
 # In[ ]:
@@ -6531,7 +7102,7 @@ class LetterResize:
 
 
 
-# In[38]:
+# In[41]:
 
 
 class YOLOv5KeepRatioResize:  
@@ -6570,37 +7141,6 @@ class YOLOv5KeepRatioResize:
                 f'expect scale_factor is float or Tuple(float), but'
                 f'get {type(scale_factor)}')
 
-    def _get_rescale_ratio(old_size: Tuple[int, int],
-                           scale: Union[float, Tuple[int]]) -> float:
-        
-        """Calculate the ratio for rescaling.
-
-        Args:
-            old_size (tuple[int]): The old size (w, h) of image.
-            scale (float | tuple[int]): The scaling factor or maximum size.
-                If it is a float number, then the image will be rescaled by
-                this factor, else if it is a tuple of 2 integers, then
-                the image will be rescaled as large as possible within
-                the scale.
-
-        Returns:
-            float: The resize ratio.
-        """
-        w, h = old_size
-        if isinstance(scale, (float, int)):
-            if scale <= 0:
-                raise ValueError(f'Invalid scale {scale}, must be positive.')
-            scale_factor = scale
-        elif isinstance(scale, tuple):
-            max_long_edge = max(scale)
-            max_short_edge = min(scale)
-            scale_factor = min(max_long_edge / max(w, h),
-                               max_short_edge / min(w, h))
-        else:
-            raise TypeError('Scale must be a number or tuple of int, '
-                            f'but got {type(scale)}')
-
-        return scale_factor
 
     def _resize_img(self, results: dict):
         """Resize images with ``results['scale']``."""
@@ -6609,26 +7149,26 @@ class YOLOv5KeepRatioResize:
         if results.get('img', None) is not None:
             image = results['img']
             original_h, original_w = image.shape[:2]
-            ratio = self._get_rescale_ratio((original_w, original_h),
+            ratio = _get_rescale_ratio((original_w, original_h),
                                             self.scale)
 
             if ratio != 1:
-#                 image = mmcv.imresize(
-#                     img=image,
-#                     size=(int(original_w * ratio), int(original_h * ratio)),
-#                     interpolation='area' if ratio < 1 else 'bilinear',
-#                     backend=self.backend)
-                image = transform.resize(
+                image = imresize(
                     img=image,
-                    size=(int(original_h * ratio), int(original_w * ratio)),
+                    size=(int(original_w * ratio), int(original_h * ratio)),
                     interpolation='area' if ratio < 1 else 'bilinear',
-                )
+                    backend=self.backend)
+#                 image = transform.resize(
+#                     img=image,
+#                     size=(int(original_h * ratio), int(original_w * ratio)),
+#                     interpolation='area' if ratio < 1 else 'bilinear',
+#                 )
 
             resized_h, resized_w = image.shape[:2]
             scale_ratio_h = resized_h / original_h
             scale_ratio_w = resized_w / original_w
             scale_factor = (scale_ratio_w, scale_ratio_h)
-            image = image.numpy()
+            # image = image.numpy()
             results['img'] = image
             results['img_shape'] = image.shape[:2]
             results['scale_factor'] = scale_factor
@@ -6644,7 +7184,7 @@ class YOLOv5KeepRatioResize:
 #                 results['gt_masks'] = results['gt_masks'].resize(
 #                     results['img_shape'])
 
-                result['gt_masks'] = (transform.resize(img=results['gt_masks'],
+                results['gt_masks'] = (transform.resize(img=results['gt_masks'],
                                                        size=results['img_shape'])).numpy()
                                       
     def _resize_bboxes(self, results: dict) -> None:
@@ -6682,16 +7222,16 @@ class YOLOv5KeepRatioResize:
                     interpolation='nearest',
                 )
             else:
-#                 gt_seg = mmcv.imresize(
-#                     results['gt_seg_map'],
-#                     results['scale'],
-#                     interpolation='nearest',
-#                     backend=self.backend)
-                gt_seg = (transform.resize(
-                    img = results['gt_seg_map'],
-                    size = (results['scale'][1],results['scale'][0]), #change
+                gt_seg = imresize(
+                    results['gt_seg_map'],
+                    results['scale'],
                     interpolation='nearest',
-                )).numpy()
+                    backend=self.backend)
+#                 gt_seg = (transform.resize(
+#                     img = results['gt_seg_map'],
+#                     size = (results['scale'][1],results['scale'][0]), #change
+#                     interpolation='nearest',
+#                 )).numpy()
             results['gt_seg_map'] = gt_seg
 
     def _resize_keypoints(self, results: dict) -> None:
@@ -6728,6 +7268,7 @@ class YOLOv5KeepRatioResize:
         self._resize_masks(results)
         self._resize_seg(results)
         self._record_homography_matrix(results)
+        # print(f'in {self.__class__}')
         return results
     
 
@@ -6739,7 +7280,7 @@ class YOLOv5KeepRatioResize:
 
 
 
-# In[39]:
+# In[42]:
 
 
 class YOLOv5HSVRandomAug:
@@ -6782,10 +7323,10 @@ class YOLOv5HSVRandomAug:
         img = Image.fromarray(results['img']) # TODO : results[img] can not be Image object must np.ndarray
         hsv = img.convert('HSV')
         hsv_arr = np.array(hsv)
-        h_channel = ((hsv_arr[..., 0].astype(np.float32) * hsv_gains[0]) % 256).astype(np.unit8)
+        h_channel = ((hsv_arr[..., 0].astype(np.float32) * hsv_gains[0]) % 256).astype(np.uint8)
         s_channel = np.clip((hsv_arr[..., 1].astype(np.float32) * hsv_gains[1]), 0, 255).astype(np.uint8)
         v_channel = np.clip((hsv_arr[..., 2].astype(np.float32) * hsv_gains[2]), 0, 255).astype(np.uint8)
-        hsv_obj = np.stack[h_channel, s_channel, v_channel]
+        hsv_obj = np.stack([h_channel, s_channel, v_channel])
         image = Image.fromarray(hsv_obj,mode='HSV')
         results['img'] = np.array(image.convert('RGB'))
 #         table_list = np.arange(0, 256, dtype=hsv_gains.dtype)
@@ -6797,6 +7338,7 @@ class YOLOv5HSVRandomAug:
 #             (cv2.LUT(hue, lut_hue), cv2.LUT(sat,
 #                                             lut_sat), cv2.LUT(val, lut_val)))
 #         results['img'] = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR)
+#         print(f'in {self.__class__}')
         return results
 
 
@@ -6806,7 +7348,7 @@ class YOLOv5HSVRandomAug:
 
 
 
-# In[40]:
+# In[43]:
 
 
 class YOLOv5RandomAffine:
@@ -6840,88 +7382,70 @@ class YOLOv5RandomAffine:
         self.max_aspect_ratio = max_aspect_ratio
         self.resample_num = resample_num
         
-    def bbox_project(bbox,w_matrix): # TODO if for compatibility can replace jt with np
-        bboxes = jt.array(bbox)
-        wrap_matrix = jt.array(w_matrix)
-        x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
-        ver = jt.stack([
-            jt.stack(x1, y1, dim=1),
-            jt.stack(x2, y1, dim=1),
-            jt.stack(x1, y2, dim=1),
-            jt.stack(x2, y2, dim=1),
-        ])
-        h_var = jt.concat([
-            vertices,
-            jt.ones((
-                ver.shape[0],
-                ver.shape[1],
-                1
-            ),dim = 2)
-        ])
-        t_h = jt.enisum('ij,nki -> nki',wrap_matrix,bboxes)
-        w = t_h[..., 2:3]
-        t_v = t_h[..., :2] / w
-        n_x1 = t_v[...,0].min(dim=1)
-        n_y1 = t_v[...,1].min(dim=1)
-        n_x2 = t_v[...,0].max(dim=1)
-        n_y2 = t_v[...,1].max(dim = 1)
+
         
-        bboxes = (jt.stack([n_x1,n_y1,n_x2,n_y2])).numpy
-        return bboxes
-    
-    
-    def bbox_is_inside(bboxes,area:list):
-        
-        width ,height = enumerate(area)
-        cond1 = bboxes[...,0] >=0
-        cond2 = bboxes[...,1] >=0
-        cond3 = bboxes[...,2] <= width
-        cond4 = bboxes[...,3] <= height
-        return cond1 and cond2 and cond3 and cond4
-        
-    def __call__(self, result : dict) -> dict:
+    def __call__(self, results : dict) -> dict:
         img = results['img']
         height = img.shape[0] + self.border[1] * 2
         width = img.shape[1] + self.border[0] * 2
 
-        warp_matrix = self._get_random_homography_matrix(width, height)
-        i = warp_matrix[2,2]
-        if abs(i) < 1e-6:
-            raise ValueError
-        n_wrap_matrix = warp_matrix / i
-        a, b, c = n_wrap_matrix[0]
-        d,e,f = n_wrap_matrix[1]
-        g,h,_ = n_wrap_matrix[2]
-        per_data = (a,b,c,d,e,f,g,h) 
+        center_matrix = np.eye(3, dtype=np.float32)
+        center_matrix[0, 2] = -img.shape[1] / 2
+        center_matrix[1, 2] = -img.shape[0] / 2
 
-#         img = cv2.warpPerspective(
-#             img,
-#             warp_matrix,
-#             dsize=(width, height),
-#             borderValue=self.border_val)
-        img = Image.fromarray(img)
-        img = img.transform(
-            size = (width, height),
-            method = Image.PERSPECTIVE,
-            data = per_data,
-            resample = Image.BILINEAR # NOTICE: possible difference source
-        )
-        if self.border_val != (0,0,0):
-            bg = Image.new("RGB",(width,height),self.border_val)
-            bg.paste(img)
-            img = bg
+        warp_matrix, scaling_ratio = self._get_random_homography_matrix(width =width ,height = height)
+        warp_matrix = center_matrix @ warp_matrix
+        # print(f'warp_matrix:{warp_matrix}')
+        # print(f'center_matrix:{center_matrix}')
+        # i = warp_matrix[2,2]
+        # if abs(i) < 1e-6:
+        #     raise ValueError
+        # n_wrap_matrix = warp_matrix / i
+        # a, b, c = n_wrap_matrix[0]
+        # d,e,f = n_wrap_matrix[1]
+        # g,h,_ = n_wrap_matrix[2]
+        # per_data = (a,b,c,d,e,f,g,h)
+
+        img = cv2.warpPerspective(
+            img,
+            warp_matrix,
+            dsize=(width, height),
+            borderValue=self.border_val)
+#         img = Image.fromarray(img)
+#         img = img.transform(
+#             size = (width, height),
+#             method = Image.PERSPECTIVE,
+#             data = per_data,
+#             resample = Image.BILINEAR # NOTICE: possible difference source
+#         )
+#         if self.border_val != (0,0,0):
+#             bg = Image.new("RGB",(width,height),self.border_val)
+#             bg.paste(img)
+#             img = bg
         img = np.array(img)
         results['img'] = img
         results['img_shape'] = img.shape
+        img_h, img_w = img.shape[:2]
 
         bboxes = results['gt_bboxes'] # TODO : should get [x1,y1,x2,y2]*N
         num_bboxes = len(bboxes)
         if num_bboxes:
-            bbox_project(bboxes,warp_matrix)
+            orig_bboxes = bboxes.copy()
+            orig_bboxes = bbox_rescale(orig_bboxes,[scaling_ratio, scaling_ratio])
+            # print(f'before project bboxes:{bboxes}')
+            bboxes = bbox_project(bboxes,warp_matrix)
+
             if self.bbox_clip_border:
-                bbox_clip(bboxes,[width, height])
+                # print(f'before clip bbox:{bboxes}')
+                bboxes = bbox_clip(bboxes,[width, height])
+                # print(f'after bboxes:{bboxes}')
+            else :
+                raise ValueError('test')
             # remove outside bbox
-            valid_index = bbox_is_inside(bbox,[width, height]).numpy()
+            # print(f'orig_bboxes:{orig_bboxes}')
+            # print(f'bboxes:{bboxes}')
+            valid_index = self.filter_gt_bboxes(orig_bboxes,
+                                                    bboxes)
             results['gt_bboxes'] = bboxes[valid_index]
             results['gt_bboxes_labels'] = results['gt_bboxes_labels'][
                 valid_index]
@@ -6937,21 +7461,46 @@ class YOLOv5RandomAffine:
 #                 if self.bbox_clip_border:
 #                     keypoints.clip_([height, width])
 #                 results['gt_keypoints'] = keypoints[valid_index]
+#         print(f'in {self.__class__}')
 
         return results
     
+    def filter_gt_bboxes(self, origin_bboxes,
+                         wrapped_bboxes):
+        """Filter gt bboxes.
+
+        Args:
+            origin_bboxes (HorizontalBoxes): Origin bboxes.
+            wrapped_bboxes (HorizontalBoxes): Wrapped bboxes
+
+        Returns:
+            dict: The result dict.
+        """
+        origin_w = origin_bboxes[...,2] -origin_bboxes[...,0]
+        origin_h =origin_bboxes[...,3] - origin_bboxes[...,1]
+        wrapped_w = wrapped_bboxes[...,2] - wrapped_bboxes[...,0]
+        wrapped_h = wrapped_bboxes[...,3] - wrapped_bboxes[...,1]
+        aspect_ratio = np.maximum(wrapped_w / (wrapped_h + 1e-16),
+                                  wrapped_h / (wrapped_w + 1e-16))
+
+        wh_valid_idx = (wrapped_w > self.min_bbox_size) &                        (wrapped_h > self.min_bbox_size)
+        area_valid_idx = wrapped_w * wrapped_h / (origin_w * origin_h +
+                                                  1e-16) > self.min_area_ratio
+        aspect_ratio_valid_idx = aspect_ratio < self.max_aspect_ratio
+        # print(f'out:{wh_valid_idx & area_valid_idx & aspect_ratio_valid_idx}')
+        return wh_valid_idx & area_valid_idx & aspect_ratio_valid_idx
     # get prj_matrix
     
     def _get_random_homography_matrix(self, width, height):
         # Rotation
         rotation_degree = random.uniform(-self.max_rotate_degree,
                                          self.max_rotate_degree)
-        rotation_matrix = self._get_rotation_matrix(rotation_degree)
+        rotation_matrix = self._get_rotation_matrix(rotate_degrees=rotation_degree)
 
         # Scaling
         scaling_ratio = random.uniform(self.scaling_ratio_range[0],
                                        self.scaling_ratio_range[1])
-        scaling_matrix = self._get_scaling_matrix(scaling_ratio)
+        scaling_matrix = self._get_scaling_matrix(scale_ratio=scaling_ratio)
 
         # Shear
         x_degree = random.uniform(-self.max_shear_degree,
@@ -6969,8 +7518,8 @@ class YOLOv5RandomAffine:
 
         warp_matrix = (
                 translate_matrix @ shear_matrix @ rotation_matrix @ scaling_matrix)
-        return warp_matrix
-    def _get_rotation_matrix(rotate_degrees: float) -> np.ndarray:
+        return warp_matrix, scaling_ratio
+    def _get_rotation_matrix(self, rotate_degrees: float) -> np.ndarray:
         radian = math.radians(rotate_degrees)
         rotation_matrix = np.array(
             [[np.cos(radian), -np.sin(radian), 0.],
@@ -7010,7 +7559,7 @@ class YOLOv5RandomAffine:
 
 
 
-# In[41]:
+# In[44]:
 
 
 class YOLO_Mosaic:
@@ -7180,12 +7729,13 @@ class YOLO_Mosaic:
             h_i, w_i = img_i.shape[:2]
             # keep_ratio resize
             scale_ratio_i = min(img_scale_h / h_i, img_scale_w / w_i)
-#             img_i = mmcv.imresize(
-#                 img_i, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
-            img_i = transform.resize(
-                img = img_i,
-                size = (int(h_i * scale_ratio_i), int(w_i * scale_ratio_i))
-            )
+            # print(f'scale_ratio_i:{scale_ratio_i}')
+            img_i = imresize(
+                img_i, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
+            # img_i = transform.resize(
+            #     img = img_i,
+            #     size = (int(h_i * scale_ratio_i), int(w_i * scale_ratio_i))
+            # )
 
             # compute the combine parameters
             paste_coord, crop_coord = self._mosaic_combine(
@@ -7204,9 +7754,14 @@ class YOLO_Mosaic:
             padw = x1_p - x1_c
             padh = y1_p - y1_c
 #             gt_bboxes_i.rescale_([scale_ratio_i, scale_ratio_i])
+            #jump
+            # print(f'before rescale gt_bboxes_i:{gt_bboxes_i}')
             gt_bboxes_i = bbox_rescale(gt_bboxes_i, [scale_ratio_i, scale_ratio_i])
+            # print(f'after rescale gt_bboxes_i:{gt_bboxes_i}')
+
 #             gt_bboxes_i.translate_([padw, padh])
             gt_bboxes_i = bbox_translate(gt_bboxes_i, [padw, padh])
+            # print(f'after translate gt_bboxes_i:{gt_bboxes_i}')
             mosaic_bboxes.append(gt_bboxes_i)
             mosaic_bboxes_labels.append(gt_bboxes_labels_i)
             mosaic_ignore_flags.append(gt_ignore_flags_i)
@@ -7226,12 +7781,14 @@ class YOLO_Mosaic:
 #                     offset=padh,
 #                     direction='vertical')
                 gt_masks_i = mask_translate(
+                    mask = gt_masks_i,
                     out_shape=(int(self.img_scale[0] * 2),
                     int(self.img_scale[1] * 2)),
                     offset=padw,
                     direction='horizontal'
                 )
                 gt_masks_i = mask_translate(
+                     mask = gt_masks_i,
                     out_shape=(int(self.img_scale[0] * 2),
                     int(self.img_scale[1] * 2)),
                     offset=padh,
@@ -7248,7 +7805,8 @@ class YOLO_Mosaic:
                 gt_kps_i = bbox_translate(gt_kps_i, [padw, padh])
                 mosaic_kps.append(gt_kps_i)
 
-        mosaic_bboxes = mosaic_bboxes[0].cat(mosaic_bboxes, 0)
+        # mosaic_bboxes = mosaic_bboxes[0].cat(mosaic_bboxes, 0)
+        mosaic_bboxes = np.concatenate(mosaic_bboxes, 0)
         mosaic_bboxes_labels = np.concatenate(mosaic_bboxes_labels, 0)
         mosaic_ignore_flags = np.concatenate(mosaic_ignore_flags, 0)
 
@@ -7264,7 +7822,7 @@ class YOLO_Mosaic:
         else:
             # remove outside bboxes
             inside_inds = bbox_is_inside(
-                mosaic_bboxes, [2 * img_scale_w, 2 * img_scale_h]).numpy()
+                mosaic_bboxes, [2 * img_scale_w, 2 * img_scale_h])
             mosaic_bboxes = mosaic_bboxes[inside_inds]
             mosaic_bboxes_labels = mosaic_bboxes_labels[inside_inds]
             mosaic_ignore_flags = mosaic_ignore_flags[inside_inds]
@@ -7374,8 +7932,9 @@ class YOLO_Mosaic:
         Returns:
             results (dict): Updated result dict.
         """
-
+        # print(f'in {self.__class__}')
         if random.uniform(0, 1) > self.prob:
+            raise ValueError('should not be here')
             return results
 
         if self.use_cached:
@@ -7405,7 +7964,7 @@ class YOLO_Mosaic:
             else:
                 indexes = self.get_indexes(dataset)
 
-            if not isinstance(indexes, collections.abc.Sequence):
+            if not isinstance(indexes, Sequence):
                 indexes = [indexes]
 
             if self.use_cached:
@@ -7455,7 +8014,7 @@ class YOLO_Mosaic:
 
 
 
-# In[42]:
+# In[45]:
 
 
 class YOLOv5MixUp:
@@ -7597,6 +8156,7 @@ class YOLOv5MixUp:
         results['gt_bboxes'] = mixup_gt_bboxes
         results['gt_bboxes_labels'] = mixup_gt_bboxes_labels
         results['gt_ignore_flags'] = mixup_gt_ignore_flags
+        # print(f'in {self.__class__}')
 
         return results
 
@@ -7607,7 +8167,7 @@ class YOLOv5MixUp:
 
 
 
-# In[43]:
+# In[46]:
 
 
 #module
@@ -7621,7 +8181,7 @@ class YOLOv5MixUp:
     
 
 
-# In[44]:
+# In[47]:
 
 
 class SiLU(Module):
@@ -7631,7 +8191,7 @@ class SiLU(Module):
         return x * x.sigmoid()
 
 
-# In[45]:
+# In[48]:
 
 
 class ConvModule(Module):
@@ -7759,35 +8319,45 @@ class ConvModule(Module):
             # Notcie that I do not search in mmengine for defination for kaiming_init : TODO
         if self.with_norm:
             if hasattr(self.norm, 'weight') and module.weight is not None:
-                nn.init.constant_(module.weight, val)
+                nn.init.constant_(module.weight, 1)
             if hasattr(self.norm, 'bias') and module.bias is not None:
-                nn.init.constant_(module.bias, bias)
+                nn.init.constant_(module.bias, 0)
     def execute(self, x):
         layer_index = 0
+#         print(x)
+#         print(x.shape)
+        x.to(jt.float32)
         while layer_index < len(self.order):
             layer = self.order[layer_index]
             if layer == 'conv':
-#                 if self.with_explicit_padding:
-#                     x = self.padding_layer(x)
-                # if the next operation is norm and we have a norm layer in
-                # eval mode and we have enabled `efficient_conv_bn_eval` for
-                # the conv operator, then activate the optimized forward and
-                # skip the next norm operator since it has been fused
-#                 if layer_index + 1 < len(self.order) and \
-#                         self.order[layer_index + 1] == 'norm' and \
-#                         self.with_norm and not self.norm.training and \
-#                         self.efficient_conv_bn_eval_forward is not None:
-#                     self.conv.forward = partial(
-#                         self.efficient_conv_bn_eval_forward, self.norm,
-#                         self.conv)
-#                     layer_index += 1
-#                     x = self.conv(x)
-#                     del self.conv.forward
-#                 else:
-                x = self.conv(x)
-            elif layer == 'norm' and self.with_norm:
+                if self.with_explicit_padding:
+                    raise NotImplementedError()
+                #     x = self.padding_layer(x)
+                # # if the next operation is norm and we have a norm layer in
+                # # eval mode and we have enabled `efficient_conv_bn_eval` for
+                # # the conv operator, then activate the optimized forward and
+                # # skip the next norm operator since it has been fused
+                # if layer_index + 1 < len(self.order) and \
+                #         self.order[layer_index + 1] == 'norm' and \
+                #         self.with_norm and not self.norm.training and \
+                #         self.efficient_conv_bn_eval_forward is not None:
+                #     self.conv.forward = partial(
+                #         self.efficient_conv_bn_eval_forward, self.norm,
+                #         self.conv)
+                #     layer_index += 1
+                #     x = self.conv(x)
+                #     del self.conv.forward
+                else:
+#                 print(f'in {self.__class__}')
+#                 print(self.conv.kernel_size)
+#                 print(x.shape)
+                    x = self.conv(x)
+#                 print(f'in {self.__class__}')
+#                 print(self.conv.kernel_size)
+#                 print(x.shape)
+            elif layer == 'norm' and self.with_norm and self.norm:
                 x = self.norm(x)
-            elif layer == 'act' and self.with_activation:
+            elif layer == 'act' and self.with_activation and self.activate:
                 x = self.activate(x)
             layer_index += 1
 #         if 'inplace' in act_config:
@@ -7802,7 +8372,7 @@ class ConvModule(Module):
 
 
 
-# In[46]:
+# In[49]:
 
 
 class SPPFBottleneck(Module):
@@ -7859,10 +8429,12 @@ class SPPFBottleneck(Module):
             self.conv1 = None
         self.kernel_sizes = kernel_sizes
         if isinstance(kernel_sizes, int):
+
             self.poolings = nn.MaxPool2d(
                 kernel_size=kernel_sizes, stride=1, padding=kernel_sizes // 2)
             conv2_in_channels = mid_channels * 4
         else:
+            
             self.poolings = nn.ModuleList([
                 nn.MaxPool2d(kernel_size=ks, stride=1, padding=ks // 2)
                 for ks in kernel_sizes
@@ -7882,16 +8454,60 @@ class SPPFBottleneck(Module):
         Args:
             x (Tensor): The input tensor.
         """
+        N,C,H,W = x.shape
+        change_scale_factor = 8
+        # print(x.shape)
+        # print(self.kernel_sizes)
         if self.conv1:
             x = self.conv1(x)
         if isinstance(self.kernel_sizes, int):
+            aaa = False
+            if H <= self.kernel_sizes or W <= self.kernel_sizes:
+                aaa = True
+#                 print('exe')
+                x = nn.interpolate(
+                    x,
+                    scale_factor = change_scale_factor,
+                    mode = 'nearest'
+                )
+#             print('self.kernel_sizes = int,y1')
             y1 = self.poolings(x)
+#             print('self.kernel_sizes = int,y2')
             y2 = self.poolings(y1)
-            x = jt.cat([x, y1, y2, self.poolings(y2)], dim=1)
+            
+            m = jt.cat([x, y1, y2, self.poolings(y2)], dim=1)
+            if aaa:
+                y1 = nn.interpolate(
+                    x,
+                    scale_factor = 1 / change_scale_factor,
+                    mode = 'nearest'
+                )
+                y2 = nn.interpolate(
+                    x,
+                    scale_factor = 1 / change_scale_factor,
+                    mode = 'nearest'
+                )
+            x = m
         else:
+            if H <= self.kernel_sizes[0] or W <= self.kernel_sizes[1]:
+                x = nn.interpolate(
+                    x,
+                    scale_factor = change_scale_factor,
+                    mode = 'nearest'
+                )
+#             print('self.kernel_sizes is not int,z')
+            z = [pooling(x) for pooling in self.poolings]
+            for x in z:
+                z = nn.interpolate(
+                        x,
+                        scale_factor = change_scale_factor,
+                        mode = 'nearest'
+                    )
             x = jt.cat(
-                [x] + [pooling(x) for pooling in self.poolings], dim=1)
+                [x] + z, dim=1)
         x = self.conv2(x)
+#         print(f'in {self.__class__}')
+#         print(x.shape)
         return x
 
 
@@ -7901,7 +8517,7 @@ class SPPFBottleneck(Module):
 
 
 
-# In[47]:
+# In[50]:
 
 
 # Notice : only support RemDet
@@ -8007,6 +8623,7 @@ class RepDWConv(Module):
         Returns:
             Tensor: The output tensor.
         """
+        inputs.to(jt.float32)
         if hasattr(self, 'rbr_reparam'):
             return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
 
@@ -8077,8 +8694,9 @@ class RepDWConv(Module):
                                         dtype=np.float32)
                 for i in range(self.in_channels):
                     kernel_value[i, i % input_dim, 1, 1] = 1
-                self.id_tensor = jt.from_numpy(kernel_value).to(
-                    branch.weight.device)
+#                 self.id_tensor = jt.from_numpy(kernel_value).to(
+#                     branch.weight.device)
+                self.id_tensor = jt.from_numpy(kernel_value)
             kernel = self.id_tensor
             running_mean = branch.running_mean
             running_var = branch.running_var
@@ -8094,7 +8712,7 @@ class RepDWConv(Module):
         if hasattr(self, 'rbr_reparam'):
             return
         kernel, bias = self.get_equivalent_kernel_bias()
-        self.rbr_reparam = Conv2d(
+        self.rbr_reparam = nn.Conv2d(
             in_channels=self.rbr_dense.conv.in_channels,
             out_channels=self.rbr_dense.conv.out_channels,
             kernel_size=self.rbr_dense.conv.kernel_size,
@@ -8122,7 +8740,7 @@ class RepDWConv(Module):
 
 
 
-# In[48]:
+# In[51]:
 
 
 class DarknetBottleneck(Module):
@@ -8196,7 +8814,8 @@ class DarknetBottleneck(Module):
         identity = x
         out = self.conv1(x)
         out = self.conv2(out)
-
+#         print(f'in {self.__class__}')
+#         print(x.shape)
         if self.add_identity:
             return out + identity
         else:
@@ -8209,7 +8828,7 @@ class DarknetBottleneck(Module):
 
 
 
-# In[49]:
+# In[52]:
 
 
 class ChannelC2f(Module):
@@ -8258,7 +8877,10 @@ class ChannelC2f(Module):
     def execute(self, x: jt.Var) -> jt.Var:
         y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(jt.cat(y, 1))
+        z = self.cv2(jt.cat(y, 1))
+#         print(f'in {self.__class__}')
+#         print(x.shape)
+        return z
 
 
 # In[ ]:
@@ -8267,7 +8889,7 @@ class ChannelC2f(Module):
 
 
 
-# In[50]:
+# In[53]:
 
 
 class GatedFFN(Module):  # 0608
@@ -8310,7 +8932,10 @@ class GatedFFN(Module):  # 0608
                 x = m(x)
         x = x * self.act(z)
         x = self.cv2(x)
-        return x + shortcut if self.add else x
+        z = x + shortcut if self.add else x
+#         print(f'in {self.__class__}')
+#         print(x.shape)
+        return z
 
 
 # In[ ]:
@@ -8319,7 +8944,7 @@ class GatedFFN(Module):  # 0608
 
 
 
-# In[51]:
+# In[54]:
 
 
 class CED(Module):
@@ -8353,6 +8978,8 @@ class CED(Module):
             x[..., 1::2, 1::2],
         ], dim=1)
         x = self.cv2(x)
+#         print(f'in {self.__class__}')
+#         print(x.shape)
         return x
 
 
@@ -8362,7 +8989,7 @@ class CED(Module):
 
 
 
-# In[52]:
+# In[55]:
 
 
 class RemDetPAFPN(Module):
@@ -8433,7 +9060,7 @@ class RemDetPAFPN(Module):
     def _freeze_all(self):
         """Freeze the model."""
         for m in self.modules():
-            if isinstance(m, _BatchNorm):
+            if isinstance(m,nn.BatchNorm):
                 m.eval()
             for param in m.parameters():
                 param.requires_grad = False
@@ -8462,6 +9089,13 @@ class RemDetPAFPN(Module):
             upsample_feat = self.upsample_layers[len(self.in_channels) - 1 -
                                                  idx](
                                                      feat_high)
+            # print(f'upsample_feat.shape= {upsample_feat.shape}')
+            # print(f'feat_low.shape= {feat_low.shape}')
+            if upsample_feat.shape != feat_low.shape:
+                # warnings.warn('changes logic to make code run')
+                upsample_feat = nn.interpolate(upsample_feat, size=(feat_low.shape[2],feat_low.shape[3]),
+                                               mode='bilinear',align_corners=False)
+
             if self.upsample_feats_cat_first:
                 top_down_layer_inputs = jt.cat([upsample_feat, feat_low], 1)
             else:
@@ -8476,6 +9110,10 @@ class RemDetPAFPN(Module):
             feat_low = outs[-1]
             feat_high = inner_outs[idx + 1]
             downsample_feat = self.downsample_layers[idx](feat_low)
+            if downsample_feat.shape != feat_high.shape:
+                # warnings.warn('changes logic to make code run')
+                downsample_feat = nn.interpolate(downsample_feat, size=(feat_high.shape[2],feat_high.shape[3]),
+                                               mode='bilinear',align_corners=False)
             out = self.bottom_up_layers[idx](
                 jt.cat([downsample_feat, feat_high], 1))
             outs.append(out)
@@ -8484,7 +9122,8 @@ class RemDetPAFPN(Module):
         results = []
         for idx in range(len(self.in_channels)):
             results.append(self.out_layers[idx](outs[idx]))
-
+        # print(f'results.shape:{len(results)}')
+        assert len(results) == len(self.out_channels),f'the out put should have same length like {self.out_channels}'
         return tuple(results)
     def build_reduce_layer(self, idx: int) -> nn.Module:
         """build reduce layer.
@@ -8567,7 +9206,7 @@ class RemDetPAFPN(Module):
 
 
 
-# In[53]:
+# In[56]:
 
 
 class RemNet(Module):
@@ -8637,6 +9276,7 @@ class RemNet(Module):
 
     def build_stem_layer(self) -> nn.Module:
         """Build a stem layer."""
+        # print(f'in build_stem_layer: input_channels = {self.input_channels} , output_channels = {math.ceil(self.arch_setting[0][0] * self.widen_factor / 8) * 8}')
         return ConvModule(
             self.input_channels,
 #             make_divisible(self.arch_setting[0][0], self.widen_factor),
@@ -8723,28 +9363,44 @@ class RemNet(Module):
         self._freeze_stages()
         if mode and self.norm_eval:
             for m in self.modules():
-                if isinstance(m, _BatchNorm):
+                if isinstance(m, nn.BatchNorm):
                     m.eval()
 
     def execute(self, x: jt.Var) -> tuple:
         """Forward batch_inputs from the data_preprocessor."""
         outs = []
+#         print(self.layers)
         for i, layer_name in enumerate(self.layers):
+            
+#             print(layer_name)
             layer = getattr(self, layer_name)
+#             print(layer)
+            
+#             if i >= 3:
+#                 print(x.shape)
+# #                 N,C,H,W = x.shape
+# #                 Kh, Kw = self.kernel_size
+#                 print(layer)
             x = layer(x)
+#             print(f'in {self.__class__}')
+#             print(x.shape)
             if i in self.out_indices:
                 outs.append(x)
 
         return tuple(outs)
 
 
-# In[ ]:
+# In[57]:
 
 
+def _pair(x):
+    n=2
+    if isinstance(x, Iterable):
+        return tuple(x)
+    return tuple((x, x))
 
 
-
-# In[54]:
+# In[58]:
 
 
 class MlvlPointGenerator:
@@ -8815,9 +9471,10 @@ class MlvlPointGenerator:
             and the last dimension 4 represent
             (coord_x, coord_y, stride_w, stride_h).
         """
-        device = 'cuda' if jt.is_cuda_available() else 'cpu'
+        device = _device
         assert self.num_levels == len(featmap_sizes)
         multi_level_priors = []
+#         print(f'')
         for i in range(self.num_levels):
             priors = self.single_level_grid_priors(
                 featmap_sizes[i],
@@ -8826,6 +9483,7 @@ class MlvlPointGenerator:
                 device=device,
                 with_stride=with_stride)
             multi_level_priors.append(priors)
+#         print(f'multi_level_priors.shape:{multi_level_priors}')
         return multi_level_priors
 
     def single_level_grid_priors(self,
@@ -8861,13 +9519,13 @@ class MlvlPointGenerator:
         """
         feat_h, feat_w = featmap_size
         stride_w, stride_h = self.strides[level_idx]
-        shift_x = (jt.arange(0, feat_w, device=device) +
+        shift_x = (jt.arange(0, feat_w) +
                    self.offset) * stride_w
         # keep featmap_size as Tensor instead of int, so that we
         # can convert to ONNX correctly
         shift_x = shift_x.to(dtype)
 
-        shift_y = (jt.arange(0, feat_h, device=device) +
+        shift_y = (jt.arange(0, feat_h) +
                    self.offset) * stride_h
         # keep featmap_size as Tensor instead of int, so that we
         # can convert to ONNX correctly
@@ -8883,7 +9541,8 @@ class MlvlPointGenerator:
                                          stride_h).to(dtype)
             shifts = jt.stack([shift_xx, shift_yy, stride_w, stride_h],
                                  dim=-1)
-        all_points = shifts.to(device)
+        # all_points = shifts.to(device)
+        all_points = shifts
         return all_points
 
     def valid_flags(self,
@@ -8905,7 +9564,7 @@ class MlvlPointGenerator:
             list(torch.Tensor): Valid flags of points of multiple levels.
         """
         
-        device = 'cuda' if jt.is_cuda_available() else 'cpu'
+        device = _device
         
         assert self.num_levels == len(featmap_sizes)
         multi_level_flags = []
@@ -8942,8 +9601,8 @@ class MlvlPointGenerator:
         feat_h, feat_w = featmap_size
         valid_h, valid_w = valid_size
         assert valid_h <= feat_h and valid_w <= feat_w
-        valid_x = jt.zeros(feat_w, dtype=jt.bool, device=device)
-        valid_y = jt.zeros(feat_h, dtype=jt.bool, device=device)
+        valid_x = jt.zeros(feat_w, dtype=jt.bool)
+        valid_y = jt.zeros(feat_h, dtype=jt.bool)
         valid_x[:valid_w] = 1
         valid_y[:valid_h] = 1
         valid_xx, valid_yy = self._meshgrid(valid_x, valid_y)
@@ -8974,14 +9633,14 @@ class MlvlPointGenerator:
             2 represent (coord_x, coord_y).
         """
         
-        device = 'cuda' if jt.is_cuda_available() else 'cpu'
+        device = _device
         
         height, width = featmap_size
         x = (prior_idxs % width + self.offset) * self.strides[level_idx][0]
         y = ((prior_idxs // width) % height +
              self.offset) * self.strides[level_idx][1]
         prioris = jt.stack([x, y], 1).to(dtype)
-        prioris = prioris.to(device)
+        # prioris = prioris.to(device)
         return prioris
 
 
@@ -8991,7 +9650,7 @@ class MlvlPointGenerator:
 
 
 
-# In[55]:
+# In[59]:
 
 
 def distance2bbox(
@@ -9060,7 +9719,7 @@ def distance2bbox(
 
 
 
-# In[56]:
+# In[60]:
 
 
 def bbox2distance(points: jt.Var,
@@ -9096,7 +9755,7 @@ def bbox2distance(points: jt.Var,
 
 
 
-# In[57]:
+# In[61]:
 
 
 class YOLODistancePointBBoxCoder:
@@ -9134,14 +9793,24 @@ class YOLODistancePointBBoxCoder:
         Returns:
             Tensor: Boxes with shape (N, 4) or (B, N, 4)
         """
+#         print(f'points.shape{points.shape} should be (B, N, 2) or (N, 2)')
+#         print(f'pred_bboxes.shape{pred_bboxes.shape} should be (B, N, 4) or (N, 4)')
+#         print(f'stride:{[s for s in stride]}')
         assert points.size(-2) == pred_bboxes.size(-2)
         assert points.size(-1) == 2
         assert pred_bboxes.size(-1) == 4
         if self.clip_border is False:
             max_shape = None
-
+#         print(f'stride.shape:{stride.shape}')
+        if stride.shape[0] != pred_bboxes.shape[1]:
+            assert stride.dim() == 1,f'stride.dim:{stride.dim()}'
+            scaled_stride = []
+            for s in stride:
+                scaled_stride.extend([s] * int(pred_bboxes.shape[1]/stride.shape[0]))
+            stride = jt.array(scaled_stride).squeeze(dim=1)
+#             print(jt.array(stride).shape)
         pred_bboxes = pred_bboxes * stride[None, :, None]
-
+#         raise NotImplementedError('debug debug')
         return distance2bbox(points, pred_bboxes, max_shape)
 
     def encode(self,
@@ -9177,9 +9846,32 @@ class YOLODistancePointBBoxCoder:
 
 
 
-# In[58]:
+# In[62]:
 
 
+def _expand_onehot_labels(labels, label_weights, label_channels, ignore_index):
+    """Expand onehot labels to match the size of prediction."""
+    bin_labels = labels.new_full((labels.size(0), label_channels), 0)
+    valid_mask = (labels >= 0) & (labels != ignore_index)
+#     bin_labels = labels.new_full((*labels.shape, label_channels), 0)
+    inds = jt.nonzero(
+        valid_mask & (labels < label_channels))
+
+    if inds.numel() > 0:
+#         print(f'bin_labels.shape:{bin_labels.shape}')
+#         print(f'labels.shape:{labels.shape}')
+#         print(f'inds.shape:{inds.shape}')
+        bin_labels[inds, labels[inds]] = 1
+
+    valid_mask = valid_mask.view(-1, 1).expand(labels.size(0),
+                                               label_channels).float()
+    if label_weights is None:
+        bin_label_weights = valid_mask
+    else:
+        bin_label_weights = label_weights.view(-1, 1).repeat(1, label_channels)
+        bin_label_weights *= valid_mask
+
+    return bin_labels, bin_label_weights, valid_mask
 def binary_cross_entropy(pred,
                          label,
                          weight=None,
@@ -9215,6 +9907,10 @@ def binary_cross_entropy(pred,
     ignore_index = -100 if ignore_index is None else ignore_index
 
     if pred.dim() != label.dim():
+#         print(f'pred.nidm = {pred.dim()}')
+#         print(f'pred.sahpe = {pred.shape}')
+#         print(f'label.nidm = {label.dim()}')
+#         print(f'label.sahpe = {label.shape}')
         label, weight, valid_mask = _expand_onehot_labels(
             label, weight, pred.size(-1), ignore_index)
     else:
@@ -9235,7 +9931,7 @@ def binary_cross_entropy(pred,
     # weighted element-wise losses
     weight = weight.float()
     loss = nn.binary_cross_entropy_with_logits(
-        pred, label.float(), pos_weight=class_weight, reduction='none')
+        pred, label.float(), pos_weight=class_weight)
     # do the reduction for the weighted loss
 #     loss = weight_reduce_loss(
 #         loss, weight, reduction=reduction, avg_factor=avg_factor)
@@ -9265,7 +9961,7 @@ def binary_cross_entropy(pred,
 
 
 
-# In[59]:
+# In[63]:
 
 
 class CrossEntropyLoss(nn.Module):
@@ -9314,7 +10010,7 @@ class CrossEntropyLoss(nn.Module):
         if self.use_sigmoid:
             self.cls_criterion = binary_cross_entropy
         else:
-            self.cls_criterion = cross_entropy_loss
+            self.cls_criterion = nn.cross_entropy_loss
 
     def extra_repr(self):
         """Extra repr."""
@@ -9354,6 +10050,8 @@ class CrossEntropyLoss(nn.Module):
             class_weight = cls_score.like(self.class_weight)
         else:
             class_weight = None
+#         print(f'cls_score.shape:{cls_score.shape}')
+#         print(f'label.shape:{label.shape}')
         loss_cls = self.loss_weight * self.cls_criterion(
             cls_score,
             label,
@@ -9373,9 +10071,39 @@ class CrossEntropyLoss(nn.Module):
 
 
 
-# In[60]:
+# In[64]:
 
 
+def select_candidates_in_gts(priors_points: jt.Var,
+                             gt_bboxes: jt.Var,
+                             eps: float = 1e-9) -> jt.Var:
+    """Select the positive priors' center in gt.
+
+    Args:
+        priors_points (Tensor): Model priors points,
+            shape(num_priors, 2)
+        gt_bboxes (Tensor): Ground true bboxes,
+            shape(batch_size, num_gt, 4)
+        eps (float): Default to 1e-9.
+    Return:
+        (Tensor): shape(batch_size, num_gt, num_priors)
+    """
+    batch_size, num_gt, _ = gt_bboxes.size()
+    gt_bboxes = gt_bboxes.reshape([-1, 4])
+
+    priors_number = priors_points.size(0)
+    priors_points = priors_points.unsqueeze(0).repeat(batch_size * num_gt, 1,
+                                                      1)
+
+    # calculate the left, top, right, bottom distance between positive
+    # prior center and gt side
+    gt_bboxes_lt = gt_bboxes[:, 0:2].unsqueeze(1).repeat(1, priors_number, 1)
+    gt_bboxes_rb = gt_bboxes[:, 2:4].unsqueeze(1).repeat(1, priors_number, 1)
+    bbox_deltas = jt.cat(
+        [priors_points - gt_bboxes_lt, gt_bboxes_rb - priors_points], dim=-1)
+    bbox_deltas = bbox_deltas.reshape([batch_size, num_gt, priors_number, -1])
+
+    return (bbox_deltas.min(dim=-1)[0] > eps).to(gt_bboxes.dtype)
 def select_highest_overlaps(pos_mask: jt.Var, overlaps: jt.Var,
                             num_gt: int) -> Tuple[jt.Var, jt.Var, jt.Var]:
     """If an anchor box is assigned to multiple gts, the one with the highest
@@ -9395,21 +10123,43 @@ def select_highest_overlaps(pos_mask: jt.Var, overlaps: jt.Var,
         pos_mask (Tensor): The assigned positive sample mask,
             shape(batch_size, num_gt, num_priors)
     """
-    fg_mask_pre_prior = pos_mask.sum(axis=-2)
-
+    # print(f'pos_mask.shape{pos_mask.shape} should be (batch_size, num_gt, num_priors)')
+    # print(f'overlaps.shape{overlaps.shape} should be (batch_size, num_gt, num_priors)')
+    # print(f'num_gt{num_gt} should be int')
+#     raise TypeError('debugging')
+#     pos_mask = pos_mask.numpy()
+    fg_mask_pre_prior = pos_mask.sum(dim=1)
+    # print(f'fg_mask_pre_prior.shape:{fg_mask_pre_prior}')
+    # raise TypeError('debugging')
+    # print(f'fg_mask_pre_prior:{fg_mask_pre_prior}')
     # Make sure the positive sample matches the only one and is the largest IoU
-    if fg_mask_pre_prior.max() > 1:
+    # print(fg_mask_pre_prior.max())
+    x = fg_mask_pre_prior.max()
+    x = x > 1
+    # print(x.shape)
+    # print(jt.all(x))
+    # print(x)
+    if x:
+    # if fg_mask_pre_prior.max() > 1:
         mask_multi_gts = (fg_mask_pre_prior.unsqueeze(1) > 1).repeat(
             [1, num_gt, 1])
-        index = overlaps.argmax(axis=1)
-        one_hot = jt.zeros(index.veiw(-1, 1).size(0), num_gt)
-        is_max_overlaps = one_hot.scatter(1, num_gt, 1)
+        index = overlaps.argmax(dim=1)
+        is_max_overlaps = nn.one_hot(index,num_gt)
+#         one_hot = jt.zeros(index.view(-1, 1).size(0), num_gt)
+#         is_max_overlaps = one_hot.scatter(1, num_gt, jt.array(1))
         is_max_overlaps =             is_max_overlaps.permute(0, 2, 1).to(overlaps.dtype)
 
         pos_mask = jt.where(mask_multi_gts, is_max_overlaps, pos_mask)
-        fg_mask_pre_prior = pos_mask.sum(axis=-2)
-
-    gt_idx_pre_prior = pos_mask.argmax(axis=-2)
+        fg_mask_pre_prior = pos_mask.sum(dim=-2)
+#     assert jt.any(pos_mask > 0)
+#     print(f'pos_mask:{pos_mask.numpy()}')
+#     print(f'pos_mask.shape:{pos_mask.shape}')
+#     gt_idx_pre_prior = pos_mask.argmax(dim=-2)
+#     print(f'pos_mask.shape = {pos_mask.shape} ,should be (batch_size, num_gt, num_priors)')
+    gt_idx_pre_prior, _ = pos_mask.argmax(dim=1)
+#     print(f'gt_idx_pre_prior.shape = {gt_idx_pre_prior.shape} ,should be (batch_size, num_priors)')
+#     raise NotImplementedError('just debugging')
+#     raise IndexError('in output gt_idx_pre_prior have one dim expand')
     return gt_idx_pre_prior, fg_mask_pre_prior, pos_mask
 def unpack_gt_instances(batch_data_samples) -> tuple:
     """Unpack ``gt_instances``, ``gt_instances_ignore`` and ``img_metas`` based
@@ -9453,7 +10203,7 @@ def unpack_gt_instances(batch_data_samples) -> tuple:
 
 
 
-# In[61]:
+# In[65]:
 
 
 def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
@@ -9462,8 +10212,8 @@ def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
     if is_filtering_by_score:
         valid_mask = scores > score_threshold
         bboxes, scores = bboxes[valid_mask], scores[valid_mask]
-        valid_inds = torch.nonzero(
-            valid_mask, as_tuple=False).squeeze(dim=1)
+        valid_inds = jt.nonzero(
+            valid_mask).squeeze(dim=1)
 
 #     inds = ext_module.nms(
 #             bboxes, scores, iou_threshold=float(iou_threshold), offset=offset)
@@ -9478,26 +10228,26 @@ def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
         y2 = bboxes[..., 3].contiguous()
         area = (x2 - x1 + offset) * (y2 - y1 + offset)
         _, order = scores.sort(0, descending = True)
-        nbboxes = bbox.shape[0]
-        select = jt.ones(nbboxes, detype = jt.bool)
-        for i in range(nboxes):
+        nbboxes = bboxes.shape[0]
+        select = jt.ones(nbboxes).bool()
+        for i in range(nbboxes):
             if select[i]:
                 x_1, y_1, x_2, y_2 = x1[i], y1[i], x2[i], y2[i]
                 area_ = area[i]
-                for j in range(i + 1, nboxes):
+                for j in range(i + 1, nbboxes):
                     if select[j]:
-                        ix1 = jt.max(x1[j], x_1)
-                        iy1 = jt.max(y1[j], y_1)
-                        ix2 = jt.min(x2[j], x_2)
-                        iy1 = jt.min(y2[j], y_2)
+                        ix1 = max_(x1[j], x_1)
+                        iy1 = max_(y1[j], y_1)
+                        ix2 = min_(x2[j], x_2)
+                        iy2 = min_(y2[j], y_2)
                         
-                        w = jt.clamp(ix2 - ix1 + offset, min=0)
-                        h = jt.clamp(iy2 - iy1 + offset, min=0)
+                        w = jt.clamp(ix2 - ix1 + offset, min_v=0)
+                        h = jt.clamp(iy2 - iy1 + offset, min_v=0)
                         inter = w * h
                         if inter/(area_ + area[j] - inter) > iou_threshold:
                             select[j] = False
-        ind = jt.masked_select(order, select)
-
+        # ind = jt.masked_select(order, select)
+        inds = order[select]
     if max_num > 0:
         inds = inds[:max_num]
     if is_filtering_by_score:
@@ -9511,7 +10261,7 @@ def nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
 
 
 
-# In[62]:
+# In[66]:
 
 
 def nms(boxes: Any,
@@ -9563,9 +10313,10 @@ def nms(boxes: Any,
     assert boxes.size(1) == 4
     assert boxes.size(0) == scores.size(0)
     assert offset in (0, 1)
-
-    inds = nmsOp(boxes, scores, iou_threshold, offset, score_threshold,
-                       max_num)
+# nmsOp(ctx: Any, bboxes: jt.Var, scores: jt.Var, iou_threshold: float,
+#                 offset: int, score_threshold: float, max_num: int)
+    inds = nmsOp(None,bboxes = boxes, scores = scores, iou_threshold = iou_threshold, offset = offset,score_threshold = score_threshold, max_num = max_num)
+                       
     dets = jt.cat((boxes[inds], scores[inds].reshape(-1, 1)), dim=1)
     if is_numpy:
         dets = dets.cpu().numpy()
@@ -9579,7 +10330,7 @@ def nms(boxes: Any,
 
 
 
-# In[63]:
+# In[67]:
 
 
 def batched_nms(boxes: jt.Var,
@@ -9653,6 +10404,8 @@ def batched_nms(boxes: jt.Var,
             max_coordinate = boxes[..., :2].max() + boxes[..., 2:4].max()
             offsets = idxs.to(boxes) * (
                 max_coordinate + jt.Var(1).to(boxes))
+            # offsets = idxs.to(boxes) * (
+            #     max_coordinate + jt.Var(1).to(boxes))
             boxes_ctr_for_nms = boxes[..., :2] + offsets[:, None]
             boxes_for_nms = jt.cat([boxes_ctr_for_nms, boxes[..., 2:5]],
                                       dim=-1)
@@ -9680,15 +10433,16 @@ def batched_nms(boxes: jt.Var,
         scores = dets[:, -1]
     else:
         max_num = nms_cfg_.pop('max_num', -1)
-        total_mask = scores.new_zeros(scores.size(), dtype=jt.bool)
+        total_mask = scores.new_zeros(scores.size()).bool()
         # Some type of nms would reweight the score, such as SoftNMS
         scores_after_nms = scores.new_zeros(scores.size())
         for id in jt.unique(idxs):
-            mask = (idxs == id).nonzero(as_tuple=False).view(-1)
+            
+            mask = (idxs == id).nonzero().view(-1)
             dets, keep = nms_op(boxes_for_nms[mask], scores[mask], **nms_cfg_)
             total_mask[mask[keep]] = True
             scores_after_nms[mask[keep]] = dets[:, -1]
-        keep = total_mask.nonzero(as_tuple=False).view(-1)
+        keep = total_mask.nonzero().view(-1)
 
         scores, inds = scores_after_nms[keep].sort(descending=True)
         keep = keep[inds]
@@ -9709,7 +10463,187 @@ def batched_nms(boxes: jt.Var,
 
 
 
-# In[64]:
+# In[68]:
+
+
+def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
+                            batch_size: int) -> jt.Var:
+    """Split batch_gt_instances with batch size.
+
+    From [all_gt_bboxes, box_dim+2] to [batch_size, number_gt, box_dim+1].
+    For horizontal box, box_dim=4, for rotated box, box_dim=5
+
+    If some shape of single batch smaller than
+    gt bbox len, then using zeros to fill.
+
+    Args:
+        batch_gt_instances (Sequence[jt.Var]): Ground truth
+            instances for whole batch, shape [all_gt_bboxes, box_dim+2]
+        batch_size (int): Batch size.
+
+    Returns:
+        jt.Var: batch gt instances data, shape
+                [batch_size, number_gt, box_dim+1]
+    """
+    if isinstance(batch_gt_instances, Sequence):
+        max_gt_bbox_len = max(
+            [len(gt_instances) for gt_instances in batch_gt_instances])
+        # fill zeros with length box_dim+1 if some shape of
+        # single batch not equal max_gt_bbox_len
+        batch_instance_list = []
+        for index, gt_instance in enumerate(batch_gt_instances):
+            bboxes = gt_instance.bboxes
+            labels = gt_instance.labels
+            box_dim = jt.array(bboxes).size(-1)
+            batch_instance_list.append(
+                jt.cat((labels[:, None], bboxes), dim=-1))
+
+            if bboxes.shape[0] >= max_gt_bbox_len:
+                continue
+
+            fill_tensor = bboxes.new_full(
+                [max_gt_bbox_len - bboxes.shape[0], box_dim + 1], 0)
+            batch_instance_list[index] = jt.cat(
+                (batch_instance_list[index], fill_tensor), dim=0)
+
+        return jt.stack(batch_instance_list)
+    else:
+        # faster version
+        # format of batch_gt_instances: [img_ind, cls_ind, (box)]
+        # For example horizontal box should be:
+        # [img_ind, cls_ind, x1, y1, x2, y2]
+        # Rotated box should be
+        # [img_ind, cls_ind, x, y, w, h, a]
+
+        # sqlit batch gt instance [all_gt_bboxes, box_dim+2] ->
+        # [batch_size, max_gt_bbox_len, box_dim+1]
+        assert isinstance(batch_gt_instances, jt.Var)
+        box_dim = batch_gt_instances.size(-1) - 2
+        if len(batch_gt_instances) > 0:
+#             print(batch_gt_instances)
+            gt_images_indexes = batch_gt_instances[:, 0]
+#             print(f'gt_images_indexes:{gt_images_indexes.numpy()}')
+#             print(f'gt_images_indexes.unique():{gt_images_indexes.unique().numpy()}')
+#             print(f'gt_images_indexes.unique(return_counts=True):{gt_images_indexes.unique(return_counts=True).numpy()}')
+#             print(f'gt_images_indexes.unique(return_counts=True)[1]:{gt_images_indexes.unique(return_counts=True)[1].numpy()}')
+#out:
+#             gt_images_indexes:[1. 1. 2. 2.]
+            # gt_images_indexes.unique():[1. 1.]
+            # gt_images_indexes.unique(return_counts=True):[1. 1.]
+            # gt_images_indexes.unique(return_counts=True)[1]:[1.]
+            # maybe jittor not supports this well, change to numpy
+            gt_images_indexes = gt_images_indexes.numpy()
+#             max_gt_bbox_len = gt_images_indexes.unique(
+#                 return_counts=True)[1].max()
+            max_gt_bbox_len = np.unique(gt_images_indexes,
+                return_counts=True)[1].max()
+#             max_gt_bbox_len = jt.unique(gt_images_indexes,
+#                 return_counts=True)[1].max() + 1
+            # fill zeros with length box_dim+1 if some shape of
+            # single batch not equal max_gt_bbox_len
+#             print(f'(batch_size, max_gt_bbox_len, box_dim + 1):{(batch_size, len(max_gt_bbox_len), box_dim + 1)}')
+            batch_instance = jt.zeros(
+                (batch_size, int(max_gt_bbox_len), box_dim + 1),
+                dtype=batch_gt_instances.dtype,)
+#             print(max_gt_bbox_len)
+#             print(int(max_gt_bbox_len))
+#                 device=batch_gt_instances.device)
+
+
+#             batch_instance = batch_instance.numpy()
+            batch_gt_instances = jt.array(batch_gt_instances)
+            for i in range(batch_size):
+                match_indexes = gt_images_indexes == i
+                gt_num = match_indexes.sum()
+#                 print(i)
+#                 print(batch_size)
+#                 print(gt_images_indexes)
+                if gt_num:
+#                     print(f'gt_num:{gt_num}')
+#                     print(f'match_indexes:{match_indexes.numpy()}')
+#                     print(f'match_indexes:{list(match_indexes)}')
+#                     print(f'match_indexes:{list(match_indexes.numpy())}')
+#                     match_indexes = match_indexes.numpy()
+#                     print(f'match_indexes:{list(match_indexes)}')
+#                     print(f'batch_gt_instances.shape:{batch_gt_instances.shape}')
+#                     print(f'batch_instance.shape:{batch_instance.shape}')
+                    batch_instance[i, :gt_num] = batch_gt_instances[
+                        jt.array(match_indexes), 1:]
+#             raise NotImplementedError('test shape')
+#             batch_instance = jt.array(batch_instance)
+        else:
+            batch_instance = jt.zeros((batch_size, 0, box_dim + 1),
+                                         dtype=batch_gt_instances.dtype,)
+#                                          device=batch_gt_instances.device)
+
+        return batch_instance
+
+
+# In[ ]:
+
+
+
+
+
+# In[69]:
+
+
+def filter_scores_and_topk(scores, score_thr, topk, results=None):
+    """Filter results using score threshold and topk candidates.
+
+    Args:
+        scores (Tensor): The scores, shape (num_bboxes, K).
+        score_thr (float): The score filter threshold.
+        topk (int): The number of topk candidates.
+        results (dict or list or Tensor, Optional): The results to
+           which the filtering rule is to be applied. The shape
+           of each item is (num_bboxes, N).
+
+    Returns:
+        tuple: Filtered results
+
+            - scores (Tensor): The scores after being filtered, \
+                shape (num_bboxes_filtered, ).
+            - labels (Tensor): The class labels, shape \
+                (num_bboxes_filtered, ).
+            - anchor_idxs (Tensor): The anchor indexes, shape \
+                (num_bboxes_filtered, ).
+            - filtered_results (dict or list or Tensor, Optional): \
+                The filtered results. The shape of each item is \
+                (num_bboxes_filtered, N).
+    """
+    valid_mask = scores > score_thr
+    scores = scores[valid_mask]
+    valid_idxs = jt.nonzero(valid_mask)
+
+    num_topk = min(topk, valid_idxs.size(0))
+    # jt.sort is actually faster than .topk (at least on GPUs)
+    scores, idxs = scores.sort(descending=True)
+    scores = scores[:num_topk]
+    topk_idxs = valid_idxs[idxs[:num_topk]]
+    keep_idxs, labels = topk_idxs.unbind(dim=1)
+
+    filtered_results = None
+    if results is not None:
+        if isinstance(results, dict):
+            filtered_results = {k: v[keep_idxs] for k, v in results.items()}
+        elif isinstance(results, list):
+            filtered_results = [result[keep_idxs] for result in results]
+        elif isinstance(results, jt.Var):
+            filtered_results = results[keep_idxs]
+        else:
+            raise NotImplementedError(f'Only supports dict or list or Tensor, '
+                                      f'but get {type(results)}.')
+    return scores, labels, keep_idxs, filtered_results
+
+
+# In[ ]:
+
+
+
+
+
+# In[70]:
 
 
 class YOLOv8Head(Module):
@@ -9759,8 +10693,9 @@ class YOLOv8Head(Module):
         self.num_levels = len(self.featmap_strides)
 
         self.train_cfg = train_cfg
+#         print(f'test_cfg:{test_cfg}')
         self.test_cfg = test_cfg
-
+#         print(f'self.test_cfg:{self.test_cfg}')
         self.loss_cls: nn.Module = loss_cls
         self.loss_bbox: nn.Module = loss_bbox
 #         self.loss_obj: nn.Module = loss_obj
@@ -9782,6 +10717,8 @@ class YOLOv8Head(Module):
         self.loss_obj = None
         
     def execute(self, x: Tuple[jt.Var]) -> Tuple[List]:
+#         print(f'in {self.__class__}')
+#         print(x.shape)
         return self.head_module(x)
     
     def special_init(self):
@@ -9843,7 +10780,7 @@ class YOLOv8Head(Module):
             mlvl_priors_with_stride = self.prior_generator.grid_priors( #todo
                 self.featmap_sizes_train,
                 dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device,
+#                 device=cls_scores[0]c,
                 with_stride=True)
 
             self.num_level_priors = [len(n) for n in mlvl_priors_with_stride]
@@ -9879,9 +10816,10 @@ class YOLOv8Head(Module):
         flatten_pred_bboxes = self.bbox_coder.decode( #todo
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
-
+#         t_type = gt_bboxes.dtype
+#         assert str(gt_bboxes.dtype) == 'float32',f'gt_bboxes.dtype:{gt_bboxes.dtype}'
         assigned_result = self.assigner(
-            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
+            jt.array((flatten_pred_bboxes.detach()),dtype = jt.array(gt_bboxes).dtype),
             flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
             gt_labels, gt_bboxes, pad_bbox_flag)
 
@@ -9889,7 +10827,7 @@ class YOLOv8Head(Module):
         assigned_scores = assigned_result['assigned_scores']
         fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
 
-        assigned_scores_sum = assigned_scores.sum().clamp(min=1)
+        assigned_scores_sum = assigned_scores.sum().clamp(min_v=1)
 
         loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
         loss_cls /= assigned_scores_sum
@@ -9957,14 +10895,16 @@ class YOLOv8Head(Module):
             list[obj:`InstanceData`]: Detection results of each image
             after the post process.
         """
+#         print(f'batch_data_samples:{batch_data_samples}')
         batch_img_metas = [
-            data_samples.metainfo for data_samples in batch_data_samples
+            batch_data_samples['img_metas']
+#             data_samples.metainfo for data_samples in batch_data_samples
         ]
 
         outs = self(x)
 
         predictions = self.predict_by_feat(
-            *outs, batch_img_metas=batch_img_metas, rescale=rescale)
+            *outs, batch_img_metas=batch_img_metas, rescale=rescale, cfg=self.test_cfg)
         return predictions
     def predict_by_feat(self,
                         cls_scores: List[jt.Var],
@@ -10007,52 +10947,97 @@ class YOLOv8Head(Module):
             - bboxes (jt.Var): Has a shape (num_instances, 4),
               the last dimension 4 arrange as (x1, y1, x2, y2).
         """
+#         print(f'len = len(cls_scores) = {len(cls_scores)} \n cls_scores.shape = {[jt.array(cls_score).shape for cls_score in cls_scores]}, should be (batch_size, num_priors * num_classes, H, W)')
+#         print(f'len = len(bbox_preds) = {len(bbox_preds)} \n bbox_preds.shape = {[jt.array(bbox_pred).shape for bbox_pred in bbox_preds]}, should be (batch_size, num_priors * 4, H, W)')
+#         print(f'.shape = {.shape}, should be ')
+#         print(f'.shape = {.shape}, should be ')
+#         print(f'.shape = {.shape}, should be ')
+        assert cls_scores[0].shape[0] == bbox_preds[0].shape[0]
+        batch_size = cls_scores[0].shape[0]
+        self.num_base_priors = bbox_preds[0].shape[1] / 4
         assert len(cls_scores) == len(bbox_preds)
         if objectnesses is None:
             with_objectnesses = False
         else:
             with_objectnesses = True
             assert len(cls_scores) == len(objectnesses)
-
+#         print(f'self.test_cfg:{self.test_cfg}')
         cfg = self.test_cfg if cfg is None else cfg
+#         print(f'cfg:{cfg}')
+#         raise TypeError('debug...')
         cfg = copy.deepcopy(cfg)
 
-        multi_label = cfg.multi_label
+        multi_label = cfg['multi_label']
         multi_label &= self.num_classes > 1
-        cfg.multi_label = multi_label
+        cfg['multi_label'] = multi_label
 
         num_imgs = len(batch_img_metas)
+        num_imgs = batch_size # change logic to makes it goes
+        assert num_imgs == batch_size,f'num_imgs={num_imgs},batch_size={batch_size}'
         featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
 
         # If the shape does not change, use the previous mlvl_priors
-        if featmap_sizes != self.featmap_sizes:
+#         print(f'featmap_sizes:{featmap_sizes}')
+#         print(f'self.featmap_sizes:{self.featmap_sizes}')
+        if jt.array(featmap_sizes).shape != jt.array(self.featmap_sizes).shape:
             self.mlvl_priors = self.prior_generator.grid_priors(
                 featmap_sizes,
-                dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device)
+                dtype=cls_scores[0].dtype,)
+#                 device=cls_scores[0].device)
             self.featmap_sizes = featmap_sizes
         flatten_priors = jt.cat(self.mlvl_priors)
-
+#         print(f'flatten_priors.shape:{flatten_priors.shape}')
+#         print([(featmap_size, stride) for featmap_size, stride in zip(featmap_sizes, self.featmap_strides)])
+        featmap_sizes = np.array(featmap_sizes)
+        flatten_priors = flatten_priors.numpy()
+#         if isinstance(self.featmap_strides,jt.Var):
+#             self.featmap_strides.numpy()
+#         print(self.featmap_strides)
+#         print(self.num_base_priors)
         mlvl_strides = [
-            flatten_priors.new_full(
-                (featmap_size.numel() * self.num_base_priors, ), stride) for
+            np.full(
+                (featmap_size.size * int(self.num_base_priors), ), stride) for
             featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
         ]
+#         print(f'featmap_size:{[featmap_size for featmap_size in featmap_sizes]}')
+#         print(f'self.num_base_priors:{self.num_base_priors}')
+        
+#         print(f'featmap_size.size:{[((featmap_size.size * self.num_base_priors, ), stride) for featmap_size, stride in zip(featmap_sizes, self.featmap_strides)] }')
+#         print(f'mlvl_strides:{mlvl_strides}')
+#         self.mlvl_priors = self.prior_generator.grid_priors(
+#                 featmap_sizes,
+#                 dtype=cls_scores[0].dtype,)
+        featmap_sizes = jt.array(featmap_sizes)
+        flatten_priors = jt.array(flatten_priors)
+#         mlvl_strides = jt.array(mlvl_strides)
+#         print(f'mlvl_strides:{mlvl_strides.numpy()}')
+#         print(f'mlvl_strides.type:{type(mlvl_strides)}')
         flatten_stride = jt.cat(mlvl_strides)
-
+#         print(f'flatten_stride.shape:{flatten_stride.shape}')
+        
         # flatten cls_scores, bbox_preds and objectness
         flatten_cls_scores = [
             cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
                                                   self.num_classes)
             for cls_score in cls_scores
         ]
+#         print(f'flatten_priors[None].shape:{flatten_priors[None].shape}')
+#         print(f'jt.array(bbox_preds).permute(0, 2, 3, 1).reshape(num_imgs, -1, 4).shape:{jt.array(bbox_preds).permute(0, 2, 3, 1).reshape(num_imgs, -1, 4).shape}')
+#         print(f'len = len(bbox_preds) = {len(bbox_preds)} \n bbox_preds.shape = {[jt.array(bbox_pred).shape for bbox_pred in bbox_preds]}, should be (batch_size, num_priors * 4, H, W)')
+        
         flatten_bbox_preds = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
         ]
+#         print(f'len = len(flatten_bbox_preds) = {len(flatten_bbox_preds)} \n bbox_preds.shape = {[jt.array(flatten_bbox_pred).shape for flatten_bbox_pred in flatten_bbox_preds]}, should be (batch_size, num_priors * 4, H, W)')
 
+#         print(f'bbox_preds.shape:{jt.array(bbox_preds).shape}')
+#         print(f'flatten_priors[None].shape:{flatten_priors[None].shape}')
+#         print(f'flatten_bbox_preds.shape:{jt.array(flatten_bbox_preds).shape}')
+#12800,4
         flatten_cls_scores = jt.cat(flatten_cls_scores, dim=1).sigmoid()
         flatten_bbox_preds = jt.cat(flatten_bbox_preds, dim=1)
+#         print(f'flatten_bbox_preds.shape:{jt.array(flatten_bbox_preds).shape}')
         flatten_decoded_bboxes = self.bbox_coder.decode(
             flatten_priors[None], flatten_bbox_preds, flatten_stride)
 
@@ -10066,9 +11051,15 @@ class YOLOv8Head(Module):
             flatten_objectness = [None for _ in range(num_imgs)]
 
         results_list = []
+#         i = 0
         for (bboxes, scores, objectness,
              img_meta) in zip(flatten_decoded_bboxes, flatten_cls_scores,
-                              flatten_objectness, batch_img_metas):
+                              flatten_objectness, *batch_img_metas):
+#             i+=1
+#             print(f'batch_img_metas:{batch_img_metas}')
+# #             img_meta = dict(*img_meta)
+#             print(f'img_meta:{img_meta}')
+            
             ori_shape = img_meta['ori_shape']
             scale_factor = img_meta['scale_factor']
             if 'pad_param' in img_meta:
@@ -10098,7 +11089,7 @@ class YOLOv8Head(Module):
                 continue
 
             nms_pre = cfg.get('nms_pre', 100000)
-            if cfg.multi_label is False:
+            if cfg['multi_label'] is False:
                 scores, labels = scores.max(1, keepdim=True)
                 scores, _, keep_idxs, results = filter_scores_and_topk(
                     scores,
@@ -10115,11 +11106,11 @@ class YOLOv8Head(Module):
 
             if rescale:
                 if pad_param is not None:
-                    results.bboxes -= results.bboxes.like([
+                    results.bboxes -= jt.full_like(results.bboxes ,[
                         pad_param[2], pad_param[0], pad_param[2], pad_param[0]
                     ])
-                results.bboxes /= results.bboxes.like(
-                    scale_factor).repeat((1, 2))
+                results.bboxes /= jt.full_like(results.bboxes, jt.array(
+                    scale_factor).repeat((1, 2)))
 
             if cfg.get('yolox_style', False):
                 # do not need max_per_img
@@ -10131,8 +11122,8 @@ class YOLOv8Head(Module):
                 rescale=False,
                 with_nms=with_nms,
                 img_meta=img_meta)
-            results.bboxes[:, 0::2].clamp_(0, ori_shape[1])
-            results.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+            results.bboxes[:, 0::2].clamp(0, ori_shape[1])
+            results.bboxes[:, 1::2].clamp(0, ori_shape[0])
 
             results_list.append(results)
         return results_list
@@ -10165,7 +11156,8 @@ class YOLOv8Head(Module):
         else:
             outs = self(x)
             # Fast version
-            loss_inputs = outs + (batch_data_samples['bboxes_labels'],
+            # print(f'batch_data_samples:{batch_data_samples}')
+            loss_inputs = outs + (batch_data_samples['data_samples']['bboxes_labels'],
                                   batch_data_samples['img_metas'])
             losses = self.loss_by_feat(*loss_inputs)
 
@@ -10207,7 +11199,7 @@ class YOLOv8Head(Module):
         if rescale:
             assert img_meta.get('scale_factor') is not None
             scale_factor = [1 / s for s in img_meta['scale_factor']]
-            results.bboxes = scale_boxes(results.bboxes, scale_factor)
+            results.bboxes = bbox_rescale(results.bboxes, scale_factor)
 
         if hasattr(results, 'score_factors'):
             # TODO: Add sqrt operation in order to be consistent with
@@ -10217,6 +11209,7 @@ class YOLOv8Head(Module):
 
         # filter small size bboxes
         if cfg.get('min_bbox_size', -1) >= 0:
+            boxes = results.bboxes
             w = boxes[:, 2] - boxes[:, 0]
             h = boxes[:, 3] - boxes[:, 1]
             valid_mask = (w > cfg.min_bbox_size) & (h > cfg.min_bbox_size)
@@ -10227,7 +11220,7 @@ class YOLOv8Head(Module):
         if with_nms and results.bboxes.numel() > 0:
             bboxes =results.bboxes
             det_bboxes, keep_idxs = batched_nms(bboxes, results.scores,
-                                                results.labels, cfg.nms)
+                                                results.labels, cfg.get('nms'))
             results = results[keep_idxs]
             # some nms would reweight the score, such as softnms
             results.scores = det_bboxes[:, -1]
@@ -10242,7 +11235,7 @@ class YOLOv8Head(Module):
 
 
 
-# In[65]:
+# In[71]:
 
 
 class YOLOv8HeadModule(Module):
@@ -10382,13 +11375,17 @@ class YOLOv8HeadModule(Module):
             predictions
         """
         assert len(x) == self.num_levels
-        return multi_apply(self.forward_single, x, self.cls_preds,
+        z = multi_apply(self.forward_single, x, self.cls_preds,
                            self.reg_preds)
+#         print(f'in {self.__class__}')
+#         print(x.shape)
+        return z
 
     def forward_single(self, x: jt.Var, cls_pred: nn.ModuleList,
                        reg_pred: nn.ModuleList) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = x.shape
+        x.to(jt.float32)
         cls_logit = cls_pred(x)
         bbox_dist_preds = reg_pred(x)
         if self.reg_max > 1:
@@ -10415,7 +11412,7 @@ class YOLOv8HeadModule(Module):
 
 
 
-# In[66]:
+# In[72]:
 
 
 class BatchTaskAlignedAssigner(nn.Module):
@@ -10500,11 +11497,18 @@ class BatchTaskAlignedAssigner(nn.Module):
                     shape(batch_size, num_priors)
         """
         # (num_priors, 4) -> (num_priors, 2)
+#         print(f'pred_bboxes.shape:{pred_bboxes.shape},should be (batch_size, num_priors, 4)')
+#         print(f'pred_scores.shape:{pred_scores.shape},should be (batch_size, num_priors, num_classes)')
+#         print(f'gt_labels.shape:{gt_labels.shape},should be (batch_size, num_gt, 1)')
+#         print(f'priors.shape:{priors.shape},should be (num_priors, 4)')
+#         print(f'gt_bboxes.shape:{gt_bboxes.shape},should be (batch_size, num_gt, 4)')
+#         print(f'pad_bbox_flag.shape:{pad_bbox_flag.shape},should be (batch_size, num_gt, 1)')
+#         raise NotImplementedError('still debugging')
         priors = priors[:, :2]
 
         batch_size = pred_scores.size(0)
         num_gt = gt_bboxes.size(1)
-
+#         print(f'pred_bboxes:{pred_bboxes}')
         assigned_result = {
             'assigned_labels':
             gt_bboxes.new_full(pred_scores[..., 0].shape, self.num_classes),
@@ -10533,13 +11537,26 @@ class BatchTaskAlignedAssigner(nn.Module):
 
         # normalize
         alignment_metrics *= pos_mask
-        pos_align_metrics = alignment_metrics.max(axis=-1, keepdim=True)[0]
-        pos_overlaps = (overlaps * pos_mask).max(axis=-1, keepdim=True)[0]
+        pos_align_metrics = alignment_metrics.max(dim=-1, keepdim=True)[0]
+        pos_overlaps = (overlaps * pos_mask).max(dim=-1, keepdim=True)[0]
         norm_align_metric = (
             alignment_metrics * pos_overlaps /
             (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
         assigned_scores = assigned_scores * norm_align_metric
-
+#         print(f'assigned_labels.shape:{assigned_labels.shape}')
+#         print(f'assigned_bboxes.shape:{assigned_bboxes.shape}')
+#         print(f'assigned_scores.shape:{assigned_scores.shape}')
+#         print(f'fg_mask_pre_prior.shape:{fg_mask_pre_prior.shape}')
+#         print('expect:assigned_result (dict) Assigned result:\
+#                 assigned_labels (Tensor): Assigned labels,\
+#                     shape(batch_size, num_priors)\
+#                 assigned_bboxes (Tensor): Assigned boxes,\
+#                     shape(batch_size, num_priors, 4)\
+#                 assigned_scores (Tensor): Assigned scores,\
+#                     shape(batch_size, num_priors, num_classes)\
+#                 fg_mask_pre_prior (Tensor): Force ground truth matching mask,\
+#                     shape(batch_size, num_priors)')
+#         raise NotImplementedError('during debugging')
         assigned_result['assigned_labels'] = assigned_labels
         assigned_result['assigned_bboxes'] = assigned_bboxes
         assigned_result['assigned_scores'] = assigned_scores
@@ -10577,18 +11594,24 @@ class BatchTaskAlignedAssigner(nn.Module):
         """
 
         # Compute alignment metric between all bbox and gt
-        alignment_metrics, overlaps =             self.get_box_metrics(pred_bboxes, pred_scores, gt_labels,
+        alignment_metrics, overlaps =  self.get_box_metrics(pred_bboxes, pred_scores, gt_labels,
                                  gt_bboxes, batch_size, num_gt)
 
         # get is_in_gts mask
         is_in_gts = select_candidates_in_gts(priors, gt_bboxes)
 
         # get topk_metric mask
+#         pad_bbox_flag = pad_bbox_flag.numpy()
+#         print(f'pad_bbox_flag:{pad_bbox_flag.numpy()}')
+#         print(f'pad_bbox_flag.shape:{pad_bbox_flag.shape}')
+#         print(f'self.topk:{self.topk}')
+#         print(f'pad_bbox_flag.repeat([1, 1, self.topk]):{pad_bbox_flag.repeat([1, 1, int(self.topk)]).numpy()}')
         topk_metric = self.select_topk_candidates(
             alignment_metrics * is_in_gts,
-            topk_mask=pad_bbox_flag.repeat([1, 1, self.topk]).bool())
+            topk_mask=pad_bbox_flag.repeat([1, 1, int(self.topk)]).bool())
 
         # merge all mask to a final mask
+        pad_bbox_flag = jt.array(pad_bbox_flag)
         pos_mask = topk_metric * is_in_gts * pad_bbox_flag
 
         return pos_mask, alignment_metrics, overlaps
@@ -10615,8 +11638,8 @@ class BatchTaskAlignedAssigner(nn.Module):
             overlaps (Tensor): Overlaps, shape(batch_size, num_gt, num_priors)
         """
         pred_scores = pred_scores.permute(0, 2, 1)
-        gt_labels = gt_labels.to(jt.long)
-        idx = jt.zeros([2, batch_size, num_gt], dtype=jt.long)
+        gt_labels = gt_labels.to(jt.int64)
+        idx = jt.zeros([2, batch_size, num_gt], dtype=jt.int64)
         idx[0] = jt.arange(end=batch_size).view(-1, 1).repeat(1, num_gt)
         idx[1] = gt_labels.squeeze(-1)
         bbox_scores = pred_scores[idx[0], idx[1]]
@@ -10656,16 +11679,23 @@ class BatchTaskAlignedAssigner(nn.Module):
         num_priors = alignment_gt_metrics.shape[-1]
         topk_metrics, topk_idxs = jt.topk(
             alignment_gt_metrics,
-            self.topk,
-            axis=-1,
+            int(self.topk),
+            dim=-1,
             largest=using_largest_topk)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(axis=-1, keepdim=True) >
                          self.eps).tile([1, 1, self.topk])
         topk_idxs = jt.where(topk_mask, topk_idxs,
                                 jt.zeros_like(topk_idxs))
-        one_hot = jt.zeros(topk_idxs.veiw(-1, 1).size(0), num_priors)
-        is_in_topk = one_hot.scatter(1, num_priors, 1).sum(axis=-2)
+#         one_hot = jt.zeros(topk_idxs.view(-1, 1).size(0), num_priors)
+#         print(f'one_hot.shape:{one_hot.shape}')
+#         print(f'num_priors:{num_priors}')
+#         is_in_topk = one_hot.scatter(dim = 1, index=jt.array([i for i in range(num_priors)]),src= jt.array(1)).sum(dim=-2)
+#         is_in_topk = one_hot.scatter(dim =1, index=topk_idxs.view(-1, 1),src=jt.array(1)).sum(dim=-2)
+        is_in_topk = nn.one_hot(topk_idxs, num_priors).sum(dim=-2)
+#         print(f'is_in_topk:{is_in_topk.numpy()}')
+#         print(f'one_hot.scatter(1, topk_idxs.view(-1, 1), 1):{one_hot.scatter(dim =1, index=topk_idxs.view(-1, 1),src=jt.array(1)).numpy()}')
+#         raise NotImplementedError('debugging')
         is_in_topk = jt.where(is_in_topk > 1, jt.zeros_like(is_in_topk),
                                  is_in_topk)
         return is_in_topk.to(alignment_gt_metrics.dtype)
@@ -10696,11 +11726,21 @@ class BatchTaskAlignedAssigner(nn.Module):
                 shape(batch_size, num_priors)
         """
         # assigned target labels
+#         batch_ind = jt.arange(
+#             end=batch_size, dtype=jt.int64, device=gt_labels.device)[...,
+#                                                                         None]
+#         print(f'gt_labels.shape = {gt_labels.shape} should be (batch_size, num_gt, 1)')
+#         print(f'gt_bboxes.shape = {gt_bboxes.shape} should be (batch_size, num_gt, 4)')
+#         print(f'assigned_gt_idxs.shape = {jt.array(assigned_gt_idxs).shape} should be (batch_size, num_priors)')
+#         print(f'fg_mask_pre_prior.shape = {fg_mask_pre_prior.shape} should be (batch_size, num_priors)')
+#         print(f'batch_size = {batch_size} should be int')
+#         print(f'num_gt = {num_gt} should be int')
+#         raise TypeError('debug')
         batch_ind = jt.arange(
-            end=batch_size, dtype=jt.int64, device=gt_labels.device)[...,
+            end=batch_size, dtype=jt.int64)[...,
                                                                         None]
-        assigned_gt_idxs = assigned_gt_idxs + batch_ind * num_gt
-        assigned_labels = gt_labels.long().flatten()[assigned_gt_idxs]
+        assigned_gt_idxs = jt.array(assigned_gt_idxs) + batch_ind * num_gt
+        assigned_labels = gt_labels.int64().flatten()[assigned_gt_idxs]
 
         # assigned target boxes
         assigned_bboxes = gt_bboxes.reshape([-1, 4])[assigned_gt_idxs]
@@ -10708,9 +11748,10 @@ class BatchTaskAlignedAssigner(nn.Module):
         # assigned target scores
         assigned_labels[assigned_labels < 0] = 0
         
-        one_hot = jt.zeros(assigned_labels.veiw(-1, 1).size(0), self.num_classes)
-        is_max_overlaps = one_hot.scatter(1, self.num_classes, 1)
+#         one_hot = jt.zeros(assigned_labels.veiw(-1, 1).size(0), self.num_classes)
+#         is_max_overlaps = one_hot.scatter(1, self.num_classes, 1)
 #         assigned_scores = jt.one_hot(assigned_labels, self.num_classes)
+        assigned_scores = nn.one_hot(assigned_labels, self.num_classes)
         force_gt_scores_mask = fg_mask_pre_prior[:, :, None].repeat(
             1, 1, self.num_classes)
         assigned_scores = jt.where(force_gt_scores_mask > 0,
@@ -10726,7 +11767,7 @@ class BatchTaskAlignedAssigner(nn.Module):
 
 
 
-# In[67]:
+# In[73]:
 
 
 class YOLODetector(nn.Module):
@@ -10765,7 +11806,9 @@ class YOLODetector(nn.Module):
         bbox_head.test_cfg=test_cfg
         self.bbox_head = bbox_head
         self.train_cfg = train_cfg
+#         print(f'test_cfg:{test_cfg}')
         self.test_cfg = test_cfg
+        self.data_preprocessor = data_preprocessor
 
         # TODO： Waiting for mmengine support
 #         if use_syncbn and get_world_size() > 1:
@@ -10946,8 +11989,12 @@ class YOLODetector(nn.Module):
                 - bboxes (Tensor): Has a shape (num_instances, 4),
                     the last dimension 4 arrange as (x1, y1, x2, y2).
         """
+        if not isinstance(data_samples,list):
+            data_samples = [data_samples]
         for data_sample, pred_instances in zip(data_samples, results_list):
-            data_sample.pred_instances = pred_instances
+            # print(f'data_sample:{data_sample}')
+            # print(f'data_samples:{data_samples}')
+            data_sample['pred_instances'] = pred_instances
         samplelist_boxtype2tensor(data_samples)
         return data_samples
 
@@ -10958,80 +12005,704 @@ class YOLODetector(nn.Module):
 
 
 
-# In[68]:
+# In[74]:
 
 
+# python/jtorch/gradscaler.py
+#due to no know how to interact with jittor.optimizer so copied
+# copied directly from https://github.com/JITTorch/jtorch/blob/master/python/jtorch/gradscaler.py
+def _refresh_per_optimizer_state():
+    return {}
 class GradScaler:
-    def __init__(
-            self,
-            init_scale: float = None,
-            dtype :jt.dtype= jt.float32,
-            growth_factor: float = 2.0,
-            backoff_factor: float = 0.5,
-            growth_interval :int = 2000,
-            min_scale: float = None
-    ):
-        self.dtype = dtype
-        self.finfo = jt.finfo(dtype)
-        if init_scale is None:
-            self.init_scale = self.finfo.max * 0.5
+    
+    _scale: Optional[jt.Var]
+    _grows_tracker: Optional[jt.Var]
+    _per_optimizer_states: Dict[int, Dict[str, Any]]
+    """
+    An instance ``scaler`` of :class:`GradScaler` helps perform the steps of gradient scaling
+    conveniently.
+
+    * ``scaler.scale(loss)`` multiplies a given loss by ``scaler``'s current scale factor.
+    * ``scaler.step(optimizer)`` safely unscales gradients and calls ``optimizer.step()``.
+    * ``scaler.update()`` updates ``scaler``'s scale factor.
+
+    Example::
+
+        # Creates a GradScaler once at the beginning of training.
+        scaler = GradScaler()
+
+        for epoch in epochs:
+            for input, target in data:
+                optimizer.zero_grad()
+                output = model(input)
+                loss = loss_fn(output, target)
+
+                # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
+                scaler.scale(loss).backward()
+
+                # scaler.step() first unscales gradients of the optimizer's params.
+                # If gradients don't contain infs/NaNs, optimizer.step() is then called,
+                # otherwise, optimizer.step() is skipped.
+                scaler.step(optimizer)
+
+                # Updates the scale for next iteration.
+                scaler.update()
+
+    See the :ref:`Automatic Mixed Precision examples<amp-examples>` for usage
+    (along with autocasting) in more complex cases like gradient clipping, gradient accumulation, gradient penalty,
+    and multiple losses/optimizers.
+
+    ``scaler`` dynamically estimates the scale factor each iteration.  To minimize gradient underflow,
+    a large scale factor should be used.  However, ``float16`` values can "overflow" (become inf or NaN) if
+    the scale factor is too large.  Therefore, the optimal scale factor is the largest factor that can be used
+    without incurring inf or NaN gradient values.
+    ``scaler`` approximates the optimal scale factor over time by checking the gradients for infs and NaNs during every
+    ``scaler.step(optimizer)`` (or optional separate ``scaler.unscale_(optimizer)``, see :meth:`unscale_`).
+
+    * If infs/NaNs are found, ``scaler.step(optimizer)`` skips the underlying ``optimizer.step()`` (so the params
+      themselves remain uncorrupted) and ``update()`` multiplies the scale by ``backoff_factor``.
+
+    * If no infs/NaNs are found, ``scaler.step(optimizer)`` runs the underlying ``optimizer.step()`` as usual.
+      If ``growth_interval`` unskipped iterations occur consecutively, ``update()`` multiplies the scale by
+      ``growth_factor``.
+
+    The scale factor often causes infs/NaNs to appear in gradients for the first few iterations as its
+    value calibrates.  ``scaler.step`` will skip the underlying ``optimizer.step()`` for these
+    iterations.  After that, step skipping should occur rarely (once every few hundred or thousand iterations).
+
+    Args:
+        init_scale (float, optional, default=2.**16):  Initial scale factor.
+        growth_factor (float, optional, default=2.0):  Factor by which the scale is multiplied during
+            :meth:`update` if no inf/NaN gradients occur for ``growth_interval`` consecutive iterations.
+        backoff_factor (float, optional, default=0.5):  Factor by which the scale is multiplied during
+            :meth:`update` if inf/NaN gradients occur in an iteration.
+        growth_interval (int, optional, default=2000):  Number of consecutive iterations without inf/NaN gradients
+            that must occur for the scale to be multiplied by ``growth_factor``.
+        enabled (bool, optional):  If ``False``, disables gradient scaling. :meth:`step` simply
+            invokes the underlying ``optimizer.step()``, and other methods become no-ops.
+            Default: ``True``
+    """
+    def __init__(self,
+                 init_scale=2.**16,
+                 growth_factor=2.0,
+                 backoff_factor=0.5,
+                 growth_interval=2000,
+                 enabled=True):
+        self._enabled = enabled
+
+        if self._enabled:
+            assert growth_factor > 1.0, "The growth factor must be > 1.0."
+            assert backoff_factor < 1.0, "The backoff factor must be < 1.0."
+
+            self._init_scale = init_scale
+            # self._scale will be lazily initialized during the first call to scale()
+            self._scale = None
+            self._growth_factor = growth_factor
+            self._backoff_factor = backoff_factor
+            self._growth_interval = growth_interval
+            self._init_growth_tracker = 0
+            # self._growth_tracker will be lazily initialized during the first call to scale()
+            self._growth_tracker = None
+            self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
+
+    def _check_scale_growth_tracker(self, funcname) -> Tuple[jt.Var, jt.Var]:
+        fix = "This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration."
+        assert self._scale is not None, "Attempted {} but _scale is None.  ".format(funcname) + fix
+        assert self._growth_tracker is not None, "Attempted {} but _growth_tracker is None.  ".format(funcname) + fix
+        return (self._scale, self._growth_tracker)
+
+    def _lazy_init_scale_growth_tracker(self):
+        assert self._growth_tracker is None, "_growth_tracker initialized before _scale"
+        self._scale = self._init_scale
+        self._growth_tracker = self._init_growth_tracker
+
+    def scale(self, outputs):
+        """
+        Multiplies ('scales') a tensor or list of tensors by the scale factor.
+
+        Returns scaled outputs.  If this instance of :class:`GradScaler` is not enabled, outputs are returned
+        unmodified.
+
+        Args:
+            outputs (Tensor or iterable of Tensors):  Outputs to scale.
+        """
+        if isinstance(outputs, dict):
+            outputs = outputs['loss']
+        if not self._enabled:
+            # raise IndexError('should not in here')
+            return outputs
+        
+
+        # Short-circuit for the common case.
+        if isinstance(outputs, jt.Var):
+            # assert jt.flags.use_cuda == 1
+            if self._scale is None:
+                self._lazy_init_scale_growth_tracker()
+            assert self._scale is not None
+            return outputs * self._scale
         else:
-            self.init_scale = init_scale if init_scale < self.finfo.max else self.finfo.max * 0.5
-        if min_scale is None:
-            self.min_scale = self.finfo.min * 100
+            print(outputs)
+            raise TypeError(f'expect input be jt.Var,but got {type(outputs)}')
+        def apply_scale(val):
+            if isinstance(val, jt.Var):
+                # assert jt.flags.use_cuda == 1
+                if self._scale is None:
+                    self._lazy_init_scale_growth_tracker()
+                assert self._scale is not None
+                return val * self._scale
+            elif isinstance(val, Iterable):
+                iterable = map(apply_scale, val)
+                if isinstance(val, (list, tuple)):
+                    return type(val)(iterable)
+                else:
+                    return iterable
+            else:
+                raise ValueError("outputs must be a Tensor or an iterable of Tensors")
+
+        return apply_scale(outputs)
+
+    def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16, loss):
+        with jt.no_grad():
+            optimizer.pre_step(loss)
+            for group in optimizer.param_groups:
+                for to_unscale in group["grads"]:
+                    if to_unscale is None or isinstance(to_unscale,(int,float)):
+                        continue
+                    if (not allow_fp16) and str(to_unscale.dtype) == "float16":
+                        raise ValueError("Attempting to unscale FP16 gradients.")
+                    
+                    if not (to_unscale.isinf().any()):
+                        if inv_scale != 1.0:
+                            to_unscale.update(to_unscale*inv_scale) 
+                    else:
+                        found_inf = 1.0
+
+        return found_inf
+
+    def unscale_(self, optimizer, loss):
+        """
+        Divides ("unscales") the optimizer's gradient tensors by the scale factor.
+
+        :meth:`unscale_` is optional, serving cases where you need to
+        :ref:`modify or inspect gradients<working-with-unscaled-gradients>`
+        between the backward pass(es) and :meth:`step`.
+        If :meth:`unscale_` is not called explicitly,  gradients will be unscaled  automatically during :meth:`step`.
+
+        Simple example, using :meth:`unscale_` to enable clipping of unscaled gradients::
+
+            ...
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+
+        Args:
+            optimizer (torch.optim.Optimizer):  Optimizer that owns the gradients to be unscaled.
+
+        .. note::
+            :meth:`unscale_` does not incur a CPU-GPU sync.
+
+        .. warning::
+            :meth:`unscale_` should only be called once per optimizer per :meth:`step` call,
+            and only after all gradients for that optimizer's assigned parameters have been accumulated.
+            Calling :meth:`unscale_` twice for a given optimizer between each :meth:`step` triggers a RuntimeError.
+
+        .. warning::
+            :meth:`unscale_` may unscale sparse gradients out of place, replacing the ``.grad`` attribute.
+        """
+        if not self._enabled:
+            return
+
+        self._check_scale_growth_tracker("unscale_")
+
+        optimizer_state = self._per_optimizer_states[id(optimizer)]
+        
+        if hasattr(optimizer,"get_find_inf"):
+            return
+        # FP32 division can be imprecise for certain compile options, so we carry out the reciprocal in FP64.
+        assert self._scale is not None
+        inv_scale = 1.0 / self._scale
+        found_inf = 0.0
+        optimizer_state["found_inf_per_device"] = self._unscale_grads_(optimizer, inv_scale, found_inf, False, loss)
+
+
+    def step(self, optimizer, *args, **kwargs):
+        """
+        :meth:`step` carries out the following two operations:
+
+        1.  Internally invokes ``unscale_(optimizer)`` (unless :meth:`unscale_` was explicitly called for ``optimizer``
+            earlier in the iteration).  As part of the :meth:`unscale_`, gradients are checked for infs/NaNs.
+        2.  If no inf/NaN gradients are found, invokes ``optimizer.step()`` using the unscaled
+            gradients.  Otherwise, ``optimizer.step()`` is skipped to avoid corrupting the params.
+
+        ``*args`` and ``**kwargs`` are forwarded to ``optimizer.step()``.
+
+        Returns the return value of ``optimizer.step(*args, **kwargs)``.
+
+        Args:
+            optimizer (torch.optim.Optimizer):  Optimizer that applies the gradients.
+            args:  Any arguments.
+            kwargs:  Any keyword arguments.
+
+        .. warning::
+            Closure use is not currently supported.
+        """
+        if (not self._enabled):
+            return optimizer.step(*args, **kwargs)
+
+        if "closure" in kwargs:
+            raise RuntimeError("Closure use is not currently supported if GradScaler is enabled.")
+
+        self._check_scale_growth_tracker("step")
+
+        optimizer_state = self._per_optimizer_states[id(optimizer)]
+        retval = None
+
+        if (hasattr(optimizer, "_step_supports_amp_scaling") and optimizer._step_supports_amp_scaling):
+            # This optimizer has customized scale-handling logic, so we can call optimizer.step() directly.
+            # The contract with custom optimizers is that their step() should accept an additional,
+            # optional grad_scaler kwarg.  We append self to the kwargs so the custom optimizer has full information:
+            # it can query its own state, invoke unscale_ on itself, etc
+            # The contract above is being deprecated to avoid introducing `grad_scaler: GradScaler` argument
+            # to `Optimizer.step`. The new behavior is going to add two Tensor attributes of `grad_scale`
+            # and `found_inf` to the passed optimizer so that the optimizer can utilize those
+            # to skip the parameter updates or unscale gradients before updating parameters in
+            # the fused kernel, e.g. `FusedAdamMathFunctor`.
+            # In this behavior, `GradScaler._check_inf_per_device` is called if `OptState.READY`,
+            # while the method is expected to be called by users side, i.e. their optimizers.
+            kwargs_ = kwargs
+            has_grad_scaler_kwarg = "grad_scaler" in inspect.signature(optimizer.step).parameters
+            if has_grad_scaler_kwarg:
+                warnings.warn(
+                    "GradScaler is going to stop passing itself as a keyword argument to the passed "
+                    "optimizer. In the near future GradScaler registers `grad_scale: Tensor` and "
+                    "`found_inf: Tensor` to the passed optimizer and let the optimizer use them directly.",
+                    FutureWarning)
+                kwargs_.update({"grad_scaler": self})
+            else:
+                if optimizer_state["stage"] is OptState.READY:
+                    self._check_inf_per_device(optimizer)
+                scaler = self._get_scale_async()
+                found_inf = cast(
+                    jt.Var,
+                    sum([
+                        t for t in optimizer_state["found_inf_per_device"].values()
+                    ])
+                )
+                optimizer.grad_scale = None if optimizer_state["stage"] == OptState.UNSCALED else scaler
+                optimizer.found_inf = found_inf
+            retval = optimizer.step(*args, **kwargs_)
+            optimizer_state["stage"] = OptState.STEPPED
+            if not has_grad_scaler_kwarg:
+                del optimizer.grad_scale
+                del optimizer.found_inf
+            return retval
+
+        if hasattr(optimizer,"get_find_inf"):
+            optimizer.set_grad_scale(self._scale)
+            optimizer.step()
+            optimizer_state["found_inf_per_device"] = optimizer.get_find_inf()
+            return
+        
+        retval = None
+        if not optimizer_state["found_inf_per_device"]:
+            retval = optimizer.step(*args, **kwargs)
         else:
-            self.min_scale = min_scale if min_scale > self.finfo.min else self.finfo.min * 100
-        self.growth_factor = growth_factor
-        self.backoff_factor = backoff_factor
-        self.growth_interval = growth_interval
-        self.scale_factor = jt.array(self.init_scale, dtype = dtype)
-        self.unskipped_step = 0
-        self.overflow = False
+            optimizer.post_step()
 
-    def scale(self, tensor):
-        return tensor * self.scale_factor
+        return retval
+    
 
-    def unscale(self, tensor):
-        for param_groups in optimizer.param_groups:
-            for param in param_groups['params']:
-                if param.grad is not None:
-                    param.grad = param.grad / self.scale_factor
+    def update(self, new_scale=None):
+        """
+        Updates the scale factor.
 
-    def check_overflow(self, optimizer):
-        self.overflow = False
-        for param_groups in optimizer.param_groups:
-            for param in param_groups['params']:
-                if param.grad is None:
-                    continue
-                if jt.isinf(param.grad).any() or jt.isnan(param.grad).any():
-                    self.overflow = True
-                    return self.overflow
-        return self.overflow
+        If any optimizer steps were skipped the scale is multiplied by ``backoff_factor``
+        to reduce it. If ``growth_interval`` unskipped iterations occurred consecutively,
+        the scale is multiplied by ``growth_factor`` to increase it.
 
-    def update(self):
-        if self.overflow:
-            self.scale_factor *= self.backoff_factor
-            self.unskipped_step = 0
+        Passing ``new_scale`` sets the new scale value manually. (``new_scale`` is not
+        used directly, it's used to fill GradScaler's internal scale tensor. So if
+        ``new_scale`` was a tensor, later in-place changes to that tensor will not further
+        affect the scale GradScaler uses internally.)
+
+        Args:
+            new_scale (float or :class:`torch.cuda.FloatTensor`, optional, default=None):  New scale factor.
+
+        .. warning::
+            :meth:`update` should only be called at the end of the iteration, after ``scaler.step(optimizer)`` has
+            been invoked for all optimizers used this iteration.
+        """
+        if not self._enabled:
+            return
+
+        _scale, _growth_tracker = self._check_scale_growth_tracker("update")
+
+        if new_scale is not None:
+            # Accept a new user-defined scale.
+            if isinstance(new_scale, float):
+                self._scale.fill_(new_scale)  # type: ignore[union-attr]
+            else:
+                reason = "new_scale should be a float or a 1-element torch.cuda.FloatTensor with requires_grad=False."
+                assert isinstance(new_scale, jt.float32), reason  # type: ignore[attr-defined]
+                assert new_scale.numel() == 1, reason
+                assert new_scale.requires_grad is False, reason
+                self._scale.copy_(new_scale)  # type: ignore[union-attr]
         else:
-            self.unskipped_step += 1
-            if self.unskipped_step >= growth_interval:
-                self.scale_factor *= self.growth_factor
-                self.unskipped_step = 0
-            self.scale_factor = jt.clamp(self.scale_factor, self.min_scale)
+            # Consume shared inf/nan data collected from optimizers to update the scale.
+            # If all found_inf tensors are on the same device as self._scale, this operation is asynchronous.
+            found_infs = [state["found_inf_per_device"]
+                          for state in self._per_optimizer_states.values()
+                          ]
+
+            assert len(found_infs) > 0, "No inf checks were recorded prior to update."
+
+            found_inf_combined = found_infs[0]
+            if len(found_infs) > 1:
+                for i in range(1, len(found_infs)):
+                    found_inf_combined += found_infs[i]
+
+
+            current_scale = _scale
+            if found_inf_combined:
+                current_scale *=self._backoff_factor
+                _growth_tracker = 0
+            else:
+                successful = _growth_tracker+1
+                if successful == self._growth_interval:
+                    new_scale = current_scale*self._growth_factor
+                    if new_scale < 1e9:
+                        current_scale = new_scale
+                    _growth_tracker = 0
+                else:
+                    _growth_tracker = successful
+
+            self._scale, self._growth_tracker = current_scale,_growth_tracker
+
+        # To prepare for next iteration, clear the data collected from optimizers this iteration.
+        self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
+
+    def _get_scale_async(self):
+        return self._scale
+
+    def get_scale(self):
+        """
+        Returns a Python float containing the current scale, or 1.0 if scaling is disabled.
+
+        .. warning::
+            :meth:`get_scale` incurs a CPU-GPU sync.
+        """
+        if self._enabled:
+            return self._init_scale if self._scale is None else self._get_scale_async()
+        else:
+            return 1.0
+
+    def get_growth_factor(self):
+        r"""
+        Returns a Python float containing the scale growth factor.
+        """
+        return self._growth_factor
+
+    def set_growth_factor(self, new_factor):
+        r"""
+        Args:
+            new_scale (float):  Value to use as the new scale growth factor.
+        """
+        self._growth_factor = new_factor
+
+    def get_backoff_factor(self):
+        r"""
+        Returns a Python float containing the scale backoff factor.
+        """
+        return self._backoff_factor
+
+    def set_backoff_factor(self, new_factor):
+        r"""
+        Args:
+            new_scale (float):  Value to use as the new scale backoff factor.
+        """
+        self._backoff_factor = new_factor
+
+    def get_growth_interval(self):
+        r"""
+        Returns a Python int containing the growth interval.
+        """
+        return self._growth_interval
+
+    def set_growth_interval(self, new_interval):
+        r"""
+        Args:
+            new_interval (int):  Value to use as the new growth interval.
+        """
+        self._growth_interval = new_interval
+
+    def _get_growth_tracker(self):
+        if self._enabled:
+            return self._init_growth_tracker if self._growth_tracker is None else self._growth_tracker.item()
+        else:
+            return 0
+
+    def is_enabled(self):
+        r"""
+        Returns a bool indicating whether this instance is enabled.
+        """
+        return self._enabled
 
     def state_dict(self):
-        return{
-            'dtype':self.dtype,
-            'scale_factor':self.scale_factor.item(),
-            'unskipped_step':self.unskipped_step,
-            'overflow':self.overflow
-        }
+        r"""
+        Returns the state of the scaler as a :class:`dict`.  It contains five entries:
 
-    def load(self, state_dict:Dict):
-        self.dtype = state_dict['dtype']
-        self.unskipped_step = state_dict['unskipped_factor']
-        self.scale_factor = jt.array(state_dict['scale_factor'], dtype =self.dtype)
-        self.overflow = state_dict['overflow']
+        * ``"scale"`` - a Python float containing the current scale
+        * ``"growth_factor"`` - a Python float containing the current growth factor
+        * ``"backoff_factor"`` - a Python float containing the current backoff factor
+        * ``"growth_interval"`` - a Python int containing the current growth interval
+        * ``"_growth_tracker"`` - a Python int containing the number of recent consecutive unskipped steps.
+
+        If this instance is not enabled, returns an empty dict.
+
+        .. note::
+           If you wish to checkpoint the scaler's state after a particular iteration, :meth:`state_dict`
+           should be called after :meth:`update`.
+        """
+        return {"scale": self.get_scale(),
+                "growth_factor": self._growth_factor,
+                "backoff_factor": self._backoff_factor,
+                "growth_interval": self._growth_interval,
+                "_growth_tracker": self._get_growth_tracker()} if self._enabled else {}
+
+    def load_state_dict(self, state_dict):
+        r"""
+        Loads the scaler state.  If this instance is disabled, :meth:`load_state_dict` is a no-op.
+
+        Args:
+           state_dict(dict): scaler state.  Should be an object returned from a call to :meth:`state_dict`.
+        """
+        if not self._enabled:
+            return
+
+        if len(state_dict) == 0:
+            raise RuntimeError("The source state dict is empty, possibly because it was saved "
+                               "from a disabled instance of GradScaler.")
+
+        self._init_scale = state_dict["scale"]
+        if self._scale is not None:
+            self._scale.fill_(state_dict["scale"])
+        self._growth_factor = state_dict["growth_factor"]
+        self._backoff_factor = state_dict["backoff_factor"]
+        self._growth_interval = state_dict["growth_interval"]
+        self._init_growth_tracker = state_dict["_growth_tracker"]
+        if self._growth_tracker is not None:
+            self._growth_tracker.fill_(state_dict["_growth_tracker"])
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if self._enabled:
+            assert len(self._per_optimizer_states) == 0, "A GradScaler instance may only be pickled at the beginning "                                                         "of an iteration, or at the end after scaler.update()."
+            # Pickling _scale and _growth_tracker Tensors directly triggers
+            # "warnings.warn("pickle support for Storage will be removed in 1.5..."
+            # so instead, we set the unpickled instance up to reinitialize them lazily.
+            state['_init_scale'] = self.get_scale()
+            state['_init_growth_tracker'] = self._get_growth_tracker()
+            state['_scale'] = None
+            state['_growth_tracker'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def _check_inf_per_device(self, optimizer):
+        _scale, _ = self._check_scale_growth_tracker("_check_inf_per_device")
+
+        dummy_inv_scale = 1.0
+        found_inf = 0.0
+
+        self._per_optimizer_states[id(optimizer)]["found_inf_per_device"] =             self._unscale_grads_(optimizer, dummy_inv_scale, found_inf, True)
+
+        return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
+
+    def _found_inf_per_device(self, optimizer):
+        return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
+# class GradScaler:
+#     def __init__(
+#             self,
+#             init_scale: float = None,
+#             dtype :jt.dtype= jt.float32,
+#             growth_factor: float = 2.0,
+#             backoff_factor: float = 0.5,
+#             growth_interval :int = 2000,
+#             min_scale: float = None
+#     ):
+#         self.dtype = dtype
+#         self.finfo = jt.finfo(dtype)
+#         if init_scale is None:
+#             self.init_scale = self.finfo.max * 0.5
+#         else:
+#             self.init_scale = init_scale if init_scale < self.finfo.max else self.finfo.max * 0.5
+#         if min_scale is None:
+#             self.min_scale = self.finfo.min * 100
+#         else:
+#             self.min_scale = min_scale if min_scale > self.finfo.min else self.finfo.min * 100
+#         self.growth_factor = growth_factor
+#         self.backoff_factor = backoff_factor
+#         self.growth_interval = growth_interval
+#         self.scale_factor = jt.array(self.init_scale, dtype = dtype)
+#         self.unskipped_step = 0
+#         self.overflow = False
+
+#     def scale(self, tensor):
+#         return tensor * self.scale_factor
+
+#     def unscale(self, tensor):
+#         for param_groups in optimizer.param_groups:
+#             for param in param_groups['params']:
+#                 if param.grad is not None:
+#                     param.grad = param.grad / self.scale_factor
+
+#     def check_overflow(self, optimizer):
+#         self.overflow = False
+#         for param_groups in optimizer.param_groups:
+#             for param in param_groups['params']:
+#                 if param.grad is None:
+#                     continue
+#                 if jt.isinf(param.grad).any() or jt.isnan(param.grad).any():
+#                     self.overflow = True
+#                     return self.overflow
+#         return self.overflow
+
+#     def update(self):
+#         if self.overflow:
+#             self.scale_factor *= self.backoff_factor
+#             self.unskipped_step = 0
+#         else:
+#             self.unskipped_step += 1
+#             if self.unskipped_step >= growth_interval:
+#                 self.scale_factor *= self.growth_factor
+#                 self.unskipped_step = 0
+#             self.scale_factor = jt.clamp(self.scale_factor, self.min_scale)
+
+#     def state_dict(self):
+#         return{
+#             'dtype':self.dtype,
+#             'scale_factor':self.scale_factor.item(),
+#             'unskipped_step':self.unskipped_step,
+#             'overflow':self.overflow
+#         }
+
+#     def load(self, state_dict:Dict):
+#         self.dtype = state_dict['dtype']
+#         self.unskipped_step = state_dict['unskipped_factor']
+#         self.scale_factor = jt.array(state_dict['scale_factor'], dtype =self.dtype)
+#         self.overflow = state_dict['overflow']
+#     def step(
+#         self, optimizer: jt.optim.Optimizer, *args: Any, **kwargs: Any
+#     ) -> Optional[float]:
+#         """Invoke ``unscale_(optimizer)`` followed by parameter update, if gradients are not infs/NaN.
+
+#         :meth:`step` carries out the following two operations:
+
+#         1.  Internally invokes ``unscale_(optimizer)`` (unless :meth:`unscale_` was explicitly called for ``optimizer``
+#             earlier in the iteration).  As part of the :meth:`unscale_`, gradients are checked for infs/NaNs.
+#         2.  If no inf/NaN gradients are found, invokes ``optimizer.step()`` using the unscaled
+#             gradients.  Otherwise, ``optimizer.step()`` is skipped to avoid corrupting the params.
+
+#         ``*args`` and ``**kwargs`` are forwarded to ``optimizer.step()``.
+
+#         Returns the return value of ``optimizer.step(*args, **kwargs)``.
+
+#         Args:
+#             optimizer (torch.optim.Optimizer):  Optimizer that applies the gradients.
+#             args:  Any arguments.
+#             kwargs:  Any keyword arguments.
+
+#         .. warning::
+#             Closure use is not currently supported.
+#         """
+#         self.check_overflow(optimizer)
+        
+# #         if not self._enabled:
+# #             return optimizer.step(*args, **kwargs)
+
+# #         if "closure" in kwargs:
+# #             raise RuntimeError(
+# #                 "Closure use is not currently supported if GradScaler is enabled."
+# #             )
+
+# #         self._check_scale_growth_tracker("step")
+
+# #         optimizer_state = self._per_optimizer_states[id(optimizer)]
+
+# #         if optimizer_state["stage"] is OptState.STEPPED:
+# #             raise RuntimeError(
+# #                 "step() has already been called since the last update()."
+# #             )
+
+# #         retval: Optional[float] = None
+
+# #         if getattr(optimizer, "_step_supports_amp_scaling", False):
+# #             # This optimizer has customized scale-handling logic, so we can call optimizer.step() directly.
+# #             # The contract with custom optimizers is that their step() should accept an additional,
+# #             # optional grad_scaler kwarg.  We append self to the kwargs so the custom optimizer has full information:
+# #             # it can query its own state, invoke unscale_ on itself, etc
+# #             # The contract above is being deprecated to avoid introducing `grad_scaler: GradScaler` argument
+# #             # to `Optimizer.step`. The new behavior is going to add two Tensor attributes of `grad_scale`
+# #             # and `found_inf` to the passed optimizer so that the optimizer can utilize those
+# #             # to skip the parameter updates or unscale gradients before updating parameters in
+# #             # the fused kernel, e.g. `FusedAdamMathFunctor`.
+# #             # In this behavior, `GradScaler._check_inf_per_device` is called if `OptState.READY`,
+# #             # while the method is expected to be called by users side, i.e. their optimizers.
+# #             kwargs_ = kwargs
+# #             has_grad_scaler_kwarg = (
+# #                 "grad_scaler" in inspect.signature(optimizer.step).parameters
+# #             )
+# #             if has_grad_scaler_kwarg:
+# #                 warnings.warn(
+# #                     "GradScaler is going to stop passing itself as a keyword argument to the passed "
+# #                     "optimizer. In the near future GradScaler registers `grad_scale: Tensor` and "
+# #                     "`found_inf: Tensor` to the passed optimizer and let the optimizer use them directly.",
+# #                     FutureWarning,
+# #                 )
+# #                 kwargs_.update({"grad_scaler": self})
+# #             else:
+# #                 if optimizer_state["stage"] is OptState.READY:
+# #                     self._check_inf_per_device(optimizer)
+# #                 scaler = self._get_scale_async()
+# #                 assert scaler is not None
+# #                 found_inf = cast(
+# #                     torch.Tensor,
+# #                     sum(
+# #                         [  # noqa: C419
+# #                             t.to(scaler.device, non_blocking=True)
+# #                             for t in optimizer_state["found_inf_per_device"].values()
+# #                         ]
+# #                     ),
+# #                 )
+# #                 # Take the product of the scales, if the user has already set `optimizer.grad_scale`.
+# #                 optimizer.grad_scale = (  # type: ignore[attr-defined]
+# #                     getattr(optimizer, "grad_scale", None)
+# #                     if optimizer_state["stage"] == OptState.UNSCALED
+# #                     else scaler * getattr(optimizer, "grad_scale", 1)
+# #                 )
+# #                 optimizer.found_inf = found_inf  # type: ignore[attr-defined]
+# #             retval = optimizer.step(*args, **kwargs_)
+# #             optimizer_state["stage"] = OptState.STEPPED
+# #             if not has_grad_scaler_kwarg:
+# #                 del optimizer.grad_scale  # type: ignore[attr-defined]
+# #                 del optimizer.found_inf  # type: ignore[attr-defined]
+# #             return retval
+
+# #         if optimizer_state["stage"] is OptState.READY:
+# #             self.unscale_(optimizer)
+
+# #         assert len(optimizer_state["found_inf_per_device"]) > 0, (
+# #             "No inf checks were recorded for this optimizer."
+# #         )
+
+# #         retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+
+# #         optimizer_state["stage"] = OptState.STEPPED
+
+# #         return retval
 
 
 # In[ ]:
@@ -11040,7 +12711,7 @@ class GradScaler:
 
 
 
-# In[69]:
+# In[75]:
 
 
 class AmpOptimWrapper:
@@ -11099,9 +12770,9 @@ class AmpOptimWrapper:
         # assert jt.is_cuda_available(),(
         #     '``AmpOptimizerWrapper`` is only available training '
         #     'on gpu, npu, mlu or musa')
-        assert jt.flags.use_cuda ,(
-            '``AmpOptimizerWrapper`` is only available training '
-            'on gpu, npu, mlu or musa')
+        # assert jt.flags.use_cuda ,(
+        #     '``AmpOptimizerWrapper`` is only available training '
+        #     'on gpu, npu, mlu or musa')
     
         assert accumulative_counts > 0, (
             '_accumulative_counts at least greater than or equal to 1')
@@ -11213,20 +12884,24 @@ class AmpOptimWrapper:
             kwargs: Keyword arguments passed to
                 :meth:`jt.optim.Optimizer.step`.
         """
+        if self._inner_count == 0:
+#             assert isinstance(kwargs,jt.Var),f'kwargs:{kwargs}'
+            self.loss_scaler.scale(outputs = kwargs)
         if self.clip_grad_kwargs:
-            self.loss_scaler.unscale(self.optimizer)
+#             self.loss_scaler.scale(outputs = kwargs)
+            self.loss_scaler.unscale_(self.optimizer,**kwargs)
             self._clip_grad()
         self.loss_scaler.step(self.optimizer, **kwargs)
         self.loss_scaler.update(self._scale_update_param)
 
     def _clip_grad(self) -> None:
         """Clip the gradients of parameters."""
-        params: List[torch.Tensor] = []
+        params: List[jt.Var] = []
         for param_group in self.optimizer.param_groups:
             params.extend(param_group['params'])
 
         params = list(
-            filter(lambda p: p.requires_grad and p.grad is not Noneparams))
+            filter(lambda p: p.requires_grad and  p.opt_grad(self.optimizer) is not None,params))
         if len(params) > 0:
             grad = self.clip_func(**self.clip_grad_kwargs)
             # `torch.nn.utils.clip_grad_value_` will return None.
@@ -11292,7 +12967,7 @@ class AmpOptimWrapper:
 
 
 
-# In[70]:
+# In[76]:
 
 
 def bbox_overlaps(bboxes1,
@@ -11364,7 +13039,7 @@ def bbox_overlaps(bboxes1,
 
 
 
-# In[71]:
+# In[77]:
 
 
 class COCOeval:
@@ -11546,7 +13221,7 @@ class COCOeval:
 
         # compute iou between each dt and gt region
         iscrowd = [int(o['iscrowd']) for o in gt]
-        #jump
+
 #         yolo_bbox_overlaps
         ious = maskUtils.iou(d,g,iscrowd)
         return ious
@@ -11863,7 +13538,7 @@ class COCOeval:
 
 
 
-# In[72]:
+# In[78]:
 
 
 def eval_recalls(gts,
@@ -11926,7 +13601,7 @@ def eval_recalls(gts,
                 tmp_ious = np.hstack((tmp_ious, gt_ious))
                 continue
             for j in range(ious.shape[0]):
-                gt_max_overlaps = ious.argmax(axis=1)
+                gt_max_overlaps = ious.argmax(dim=1)
                 max_ious = ious[np.arange(0, ious.shape[0]), gt_max_overlaps]
                 gt_idx = max_ious.argmax()
                 gt_ious[j] = max_ious[gt_idx]
@@ -11939,7 +13614,7 @@ def eval_recalls(gts,
     _ious = np.fliplr(np.sort(_ious, axis=1))
     recalls = np.zeros((proposal_nums.size, thrs.size))
     for i, thr in enumerate(thrs):
-        recalls[:, i] = (_ious >= thr).sum(axis=1) / float(total_gt_num)
+        recalls[:, i] = (_ious >= thr).sum(dim=1) / float(total_gt_num)
     proposal_nums = np.array(proposal_nums, dtype=np.int32)
     iou_thrs = np.array(iou_thrs)
     if row_idxs is None:
@@ -11963,7 +13638,7 @@ def eval_recalls(gts,
 
 
 
-# In[73]:
+# In[79]:
 
 
 class DetTTAModel:
@@ -12096,12 +13771,67 @@ class DetTTAModel:
 
 
 # In[ ]:
+def collect_results(results: list,
+                    size: int,
+                    device: str = 'cpu',
+                    tmpdir: Optional[str] = None) -> Optional[list]:
+    """Collected results in distributed environments.
+
+    Args:
+        results (list[object]): Result list containing result parts to be
+            collected. Each item of ``result_part`` should be a picklable
+            object.
+        size (int): Size of the results, commonly equal to length of
+            the results.
+        device (str): Device name. Optional values are 'cpu', 'gpu' or 'npu'.
+        tmpdir (str | None): Temporal directory for collected results to
+            store. If set to None, it will create a temporal directory for it.
+            ``tmpdir`` should be None when device is 'gpu' or 'npu'.
+            Defaults to None.
+
+    Returns:
+        list or None: The collected results.
+
+    Examples:
+        # >>> # distributed environment
+        # >>> # We have 2 process groups, 2 ranks.
+        # >>> import mmengine.dist as dist
+        # >>> if dist.get_rank() == 0:
+                data = ['foo', {1: 2}]
+            else:
+                data = [24, {'a': 'b'}]
+        # >>> size = 4
+        # >>> output = dist.collect_results(data, size, device='cpu')
+        # >>> output
+        ['foo', 24, {1: 2}, {'a': 'b'}]  # rank 0
+        None  # rank 1
+    """
+    if device not in ['gpu', 'cpu', 'npu']:
+        raise NotImplementedError(
+            f"device must be 'cpu' , 'gpu' or 'npu', but got {device}")
+
+    if device == 'gpu' or device == 'npu':
+        assert tmpdir is None, f'tmpdir should be None when device is {device}'
+        return results[:size]
+    else:
+        return results[:size]
+def _to_cpu(data: Any) -> Any:
+    """Transfer all tensors and BaseDataElement to cpu."""
+    if isinstance(data, (jt.Var, BaseDataElement)):
+        return data.to('cpu')
+    elif isinstance(data, list):
+        return [_to_cpu(d) for d in data]
+    elif isinstance(data, tuple):
+        return tuple(_to_cpu(d) for d in data)
+    elif isinstance(data, dict):
+        return {k: _to_cpu(v) for k, v in data.items()}
+    else:
+        return data
 
 
 
 
-
-# In[74]:
+# In[80]:
 
 
 class CocoMetric:
@@ -12241,6 +13971,55 @@ class CocoMetric:
         self.cat_ids = [0,1,2,3,4,5,6,7,8,9,10,11]
         self.img_ids = None
 
+    def evaluate(self, size: int) -> dict:
+        """Evaluate the model performance of the whole dataset after processing
+        all batches.
+
+        Args:
+            size (int): Length of the entire validation dataset. When batch
+                size > 1, the dataloader may pad some data samples to make
+                sure all ranks have the same length of dataset slice. The
+                ``collect_results`` function will drop the padded data based on
+                this size.
+
+        Returns:
+            dict: Evaluation metrics dict on the val dataset. The keys are the
+            names of the metrics, and the values are corresponding results.
+        """
+        if len(self.results) == 0:
+            print(
+                f'{self.__class__.__name__} got empty `self.results`. Please '
+                'ensure that the processed results are properly added into '
+                '`self.results` in `process` method.')
+
+        if self.collect_device == 'cpu':
+            results = collect_results(
+                self.results,
+                size,
+                self.collect_device,
+                tmpdir=self.collect_dir)
+        else:
+            results = collect_results(self.results, size, self.collect_device)
+
+        if True:
+            # cast all tensors in results list to cpu
+            results = _to_cpu(results)
+            _metrics = self.compute_metrics(results)  # type: ignore
+            # Add prefix to metric names
+            if self.prefix:
+                _metrics = {
+                    '/'.join((self.prefix, k)): v
+                    for k, v in _metrics.items()
+                }
+            metrics = [_metrics]
+        else:
+            metrics = [None]  # type: ignore
+
+        # broadcast_object_list(metrics)
+
+        # reset the results list
+        self.results.clear()
+        return metrics[0]
     def fast_eval_recall(self,
                          results: List[dict],
                          proposal_nums: Sequence[int],
@@ -12395,11 +14174,13 @@ class CocoMetric:
         result_files = dict()
         result_files['bbox'] = f'{outfile_prefix}.bbox.json'
         result_files['proposal'] = f'{outfile_prefix}.bbox.json'
-        dump(bbox_json_results, result_files['bbox'])
+        with open(result_files['bbox'], 'w',  encoding='utf-8') as f:
+            json.dump(bbox_json_results, f, indent=4)
 
         if segm_json_results is not None:
             result_files['segm'] = f'{outfile_prefix}.segm.json'
-            dump(segm_json_results, result_files['segm'])
+            with open(result_files['segm'] , 'w', encoding='utf-8') as f:
+                json.dump(segm_json_results, f, indent=4)
 
         return result_files
 
@@ -12470,7 +14251,8 @@ class CocoMetric:
         if len(annotations) > 0:
             coco_json['annotations'] = annotations
         converted_json_path = f'{outfile_prefix}.gt.json'
-        dump(coco_json, converted_json_path)
+        with open(converted_json_path, 'w', encoding='utf-8') as f:
+            json.dump(coco_json, f, indent=4)
         return converted_json_path
 
     # TODO: data_batch is no longer needed, consider adjusting the
@@ -12485,10 +14267,16 @@ class CocoMetric:
             data_samples (Sequence[dict]): A batch of data samples that
                 contain annotations and predictions.
         """
+        # if not isinstance(data_samples,list):
+        #     data_samples = [data_samples]
         for data_sample in data_samples:
+            # print(f'data_sample:{data_sample}')
+            # print(f'data_samples:{data_samples}')
+            # m = data_sample['img_metas']
+            # print(f'data_sample[img_metas]:{m[0]}')
             result = dict()
             pred = data_sample['pred_instances']
-            result['img_id'] = data_sample['img_id']
+            result['img_id'] = data_sample['img_metas'][0]['img_id']
             result['bboxes'] = pred['bboxes'].cpu().numpy()
             result['scores'] = pred['scores'].cpu().numpy()
             result['labels'] = pred['labels'].cpu().numpy()
@@ -12501,9 +14289,9 @@ class CocoMetric:
 
             # parse gt
             gt = dict()
-            gt['width'] = data_sample['ori_shape'][1]
-            gt['height'] = data_sample['ori_shape'][0]
-            gt['img_id'] = data_sample['img_id']
+            gt['width'] = data_sample['img_metas'][0]['ori_shape'][1]
+            gt['height'] = data_sample['img_metas'][0]['ori_shape'][0]
+            gt['img_id'] = data_sample['img_metas'][0]['img_id']
             if self._coco_api is None:
                 # TODO: Need to refactor to support LoadAnnotations
                 assert 'instances' in data_sample,                     'ground truth is required for evaluation when '                     '`ann_file` is not provided'
@@ -12563,7 +14351,7 @@ class CocoMetric:
             # fast eval recall
             if metric == 'proposal_fast':
                 ar = self.fast_eval_recall(
-                    preds, self.proposal_nums, self.iou_thrs, logger=logger)
+                    preds, self.proposal_nums, self.iou_thrs, logger=None)
                 log_msg = []
                 for i, num in enumerate(self.proposal_nums):
                     eval_results[f'AR@{num}'] = ar[i]
@@ -12577,7 +14365,8 @@ class CocoMetric:
             if metric not in result_files:
                 raise KeyError(f'{metric} is not in results')
             try:
-                predictions = load(result_files[metric])
+                with open(result_files[metric], 'r', encoding='utf-8') as f:
+                    predictions = json.load(f)
                 if iou_type == 'segm':
                     # Refer to https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/coco.py#L331  # noqa
                     # When evaluating mask AP, if the results contain bbox,
@@ -12733,21 +14522,21 @@ class CocoMetric:
 
 
 
-# In[75]:
+# In[81]:
 
 
 _backend_args = None
 _multiscale_resize_transforms = transform.Compose([YOLOv5KeepRatioResize(scale = (640, 640, )),
-                                                  LetterResize(scale = (640, 640, ), 
-                                                               allow_scale_up = False, 
+                                                  LetterResize(scale = (640, 640, ),
+                                                               allow_scale_up = False,
                                                                pad_val=dict(img=114)),
                                                   YOLOv5KeepRatioResize(scale = (320, 320, )),
-                                                  LetterResize(scale = (320, 320, ), 
-                                                               allow_scale_up = False, 
+                                                  LetterResize(scale = (320, 320, ),
+                                                               allow_scale_up = False,
                                                                pad_val=dict(img=114)),
                                                   YOLOv5KeepRatioResize(scale = (960, 960, )),
-                                                  LetterResize(scale = (960, 960, ), 
-                                                               allow_scale_up = False, 
+                                                  LetterResize(scale = (960, 960, ),
+                                                               allow_scale_up = False,
                                                                pad_val=dict(img=114)),]
                                                  )
 album_train_transform = [Blur(p=0.01),
@@ -12757,51 +14546,51 @@ album_train_transform = [Blur(p=0.01),
 backend_args = None
 
 
-switch_pipeline = transform.Compose([
-    LoadImageFromFile(backend_args=None),
-    LoadYOLOAnnotations(with_bbox = True),
-    YOLOv5KeepRatioResize(scale = (640, 640, )),
-                                                  LetterResize(scale = (640, 640, ), 
-                                                               allow_scale_up = True, 
-                                                               pad_val=dict(img=114.0)),
-                                                  YOLOv5RandomAffine(border_val=(
-                                                                    114,
-                                                                    114,
-                                                                    114,
-                                                                ),
-                                                                max_aspect_ratio=100,
-                                                                max_rotate_degree=0.0,
-                                                                max_shear_degree=0.0,
-                                                                scaling_ratio_range=(
-                                                                    0.5,
-                                                                    1.5,
-                                                                ),
-                                                                    ),
-                                     Albu(bbox_params=dict(
-                                            format='pascal_voc',
-                                            label_fields=[
-                                                'gt_bboxes_labels',
-                                                'gt_ignore_flags',
-                                            ],
-                                            type='BboxParams'),
-                                        keymap=dict(gt_bboxes='bboxes', img='image'),
-                                        transforms=[
-                                            dict(p=0.01, type='Blur'),
-                                            dict(p=0.01, type='MedianBlur'),
-                                            dict(p=0.01, type='ToGray'),
-                                            dict(p=0.01, type='CLAHE'),
-                                        ]),
-                                     YOLOv5HSVRandomAug,
-                                     RandomFlip(prob = 0.5),
-                                     PackDetInputs(meta_keys=(
-                                        'img_id',
-                                        'img_path',
-                                        'ori_shape',
-                                        'img_shape',
-                                        'flip',
-                                        'flip_direction',
-                                    ))
-                                    ])
+# switch_pipeline = transform.Compose([
+#     LoadImageFromFile(backend_args=None),
+#     LoadYOLOAnnotations(with_bbox = True),
+#     YOLOv5KeepRatioResize(scale = (640, 640, )),
+#                                                   LetterResize(scale = (640, 640, ),
+#                                                                allow_scale_up = True,
+#                                                                pad_val=dict(img=114.0)),
+#                                                   YOLOv5RandomAffine(border_val=(
+#                                                                     114,
+#                                                                     114,
+#                                                                     114,
+#                                                                 ),
+#                                                                 max_aspect_ratio=100,
+#                                                                 max_rotate_degree=0.0,
+#                                                                 max_shear_degree=0.0,
+#                                                                 scaling_ratio_range=(
+#                                                                     0.5,
+#                                                                     1.5,
+#                                                                 ),
+#                                                                     ),
+#                                      Albu(bbox_params=dict(
+#                                             format='pascal_voc',
+#                                             label_fields=[
+#                                                 'gt_bboxes_labels',
+#                                                 'gt_ignore_flags',
+#                                             ],
+#                                             type='BboxParams'),
+#                                         keymap=dict(gt_bboxes='bboxes', img='image'),
+#                                         transforms=[
+#                                             dict(p=0.01, type='Blur'),
+#                                             dict(p=0.01, type='MedianBlur'),
+#                                             dict(p=0.01, type='ToGray'),
+#                                             dict(p=0.01, type='CLAHE'),
+#                                         ]),
+#                                      YOLOv5HSVRandomAug(),
+#                                      RandomFlip(prob = 0.5),
+#                                      PackDetInputs(meta_keys=(
+#                                         'img_id',
+#                                         'img_path',
+#                                         'ori_shape',
+#                                         'img_shape',
+#                                         'flip',
+#                                         'flip_direction',
+#                                     ))
+#                                     ])
 
 last_transform = [Albu(bbox_params=dict(
                     format='pascal_voc',
@@ -12817,7 +14606,7 @@ last_transform = [Albu(bbox_params=dict(
                     dict(p=0.01, type='ToGray'),
                     dict(p=0.01, type='CLAHE'),
                 ]),
-                  YOLOv5HSVRandomAug,
+                  YOLOv5HSVRandomAug(),
                   RandomFlip(prob = 0.5),
                   PackDetInputs(meta_keys=(
                         'img_id',
@@ -12840,7 +14629,7 @@ last_transform = [Albu(bbox_params=dict(
 
 
 
-# In[76]:
+# In[82]:
 
 
 train_pipeline = ([
@@ -12885,7 +14674,7 @@ train_pipeline = ([
                     dict(p=0.01, type='ToGray'),
                     dict(p=0.01, type='CLAHE'),
                 ]),
-    YOLOv5HSVRandomAug,
+    YOLOv5HSVRandomAug(),
     RandomFlip(prob=0.5),
     PackDetInputs(meta_keys=(
                     'img_id',
@@ -12936,7 +14725,7 @@ train_pipeline_stage2 = [
                     dict(p=0.01, type='ToGray'),
                     dict(p=0.01, type='CLAHE'),
                 ]),
-    YOLOv5HSVRandomAug,
+    YOLOv5HSVRandomAug(),
     RandomFlip(prob=0.5),
     PackDetInputs(meta_keys=(
                     'img_id',
@@ -12977,7 +14766,7 @@ val_pipeline = [
 
 
 
-# In[77]:
+# In[83]:
 
 
 backbone = RemNet(
@@ -12996,7 +14785,7 @@ backbone = RemNet(
 
 
 
-# In[78]:
+# In[84]:
 
 
 data_preprocessor = YOLOv5DetDataPreprocessor(
@@ -13020,7 +14809,7 @@ data_preprocessor = YOLOv5DetDataPreprocessor(
 
 
 
-# In[79]:
+# In[85]:
 
 
 head_module = YOLOv8HeadModule(
@@ -13040,7 +14829,7 @@ head_module = YOLOv8HeadModule(
                 1024,
             ],
 )
-bbox_coder = YOLODistancePointBBoxCoder
+bbox_coder = YOLODistancePointBBoxCoder()
 prior_generator = MlvlPointGenerator(
     offset=0.5,
     strides=[
@@ -13057,7 +14846,7 @@ prior_generator = MlvlPointGenerator(
 
 
 
-# In[80]:
+# In[86]:
 
 
 neck = RemDetPAFPN(
@@ -13085,7 +14874,7 @@ neck = RemDetPAFPN(
 
 
 
-# In[81]:
+# In[87]:
 
 
 loss_bbox = YOLO_IoULoss(
@@ -13112,7 +14901,7 @@ loss_dfl = DistributionFocalLoss(
 
 
 
-# In[82]:
+# In[88]:
 
 
 bbox_head = YOLOv8Head(
@@ -13140,7 +14929,7 @@ bbox_head = YOLOv8Head(
 
 
 
-# In[83]:
+# In[89]:
 
 
 train_dataset = YOLOv5CocoDataset(
@@ -13183,12 +14972,11 @@ val_dataset = YOLOv5CocoDataset(
     shuffle=False)
 
 
-# In[84]:
+# In[90]:
 
 
-# print(*train_dataset)
+# print(train_dataset)
 # print(jt.in_mpi)
-#jump
 
 
 # In[ ]:
@@ -13197,7 +14985,7 @@ val_dataset = YOLOv5CocoDataset(
 
 
 
-# In[85]:
+# In[91]:
 
 
 tta_module = DetTTAModel(
@@ -13211,14 +14999,23 @@ tta_module = DetTTAModel(
 
 
 
-# In[86]:
+# In[92]:
 
 
 module = YOLODetector(
     backbone = backbone,
     bbox_head = bbox_head,
     data_preprocessor = data_preprocessor,
-    neck = neck
+    neck = neck,
+    test_cfg=model_test_cfg,
+    train_cfg=dict(
+        assigner=BatchTaskAlignedAssigner(
+            alpha=tal_alpha,
+            beta=tal_beta,
+            eps=1e-09,
+            num_classes=num_classes,
+            topk=tal_beta,
+            use_ciou=True)),
 )
 optimizer = jt.optim.SGD(
     params = module.parameters(),
@@ -13232,44 +15029,8 @@ optim = AmpOptimWrapper(
     clip_grad=dict(max_norm=10.0),
     loss_scale='dynamic'
 )
+ema = EMA(model = module)
 #notice: YOLOv5OptimizerConstructor will have no efforts,so skip
-
-
-# In[87]:
-
-
-#jump
-
-
-# In[89]:
-
-
-def train(epoch):
-#     print('in train')
-    module.train()
-    if epoch < max_epochs - close_mosaic_epochs:
-        data_stage = train_dataset
-    else:
-        data_stage = train_dataset_stage2
-#     print('after judge')
-#     print(epoch)
-    for data_batch in enumerate(data_stage):
-        i = 0
-        print('should print')
-        if i % 50 == 0:
-            print(
-                f'Epoch: {epoch} step:{i}'
-            )
-        data = module.data_preprocessor(data_batch)
-        _data = yolov5_collate(*data)
-        result = moudle(_data)
-        losses = module.loss(_data, data_batch)
-        loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
-        optim.step(loss)
-        print(
-                f'loss:{loss}\n{losses}'
-            )
-        i += 1
 
 
 # In[ ]:
@@ -13278,7 +15039,73 @@ def train(epoch):
 
 
 
-# In[90]:
+# In[93]:
+
+
+def train(epoch):
+#     print('in train')
+    module.train()
+    optimizer.zero_grad()
+    if epoch < max_epochs - close_mosaic_epochs:
+        data_stage = train_dataset
+    else:
+        data_stage = train_dataset_stage2
+#     print('after judge')
+#     print(epoch)
+    for i in range(len(data_stage)):
+        # assert jt.flags.use_cuda == 0
+        data_batch = data_stage[i]
+        # assert jt.flags.use_cuda == 0
+#         print(data_batch['inputs'].shape)
+        # print('should print')
+        if i % 50 == 0:
+            print(
+                f'Epoch(train): {epoch+1} step:{i}'
+            )
+        # assert jt.flags.use_cuda == 0
+        data = module.data_preprocessor(data_batch)
+        # assert jt.flags.use_cuda == 0
+#         print(data['inputs'].shape)
+        _data = yolov5_collate(data)
+        # assert jt.flags.use_cuda == 0
+#         print(_data['inputs'].shape)
+#         cls_logit, bbox_preds, bbox_dist_preds = module(_data['inputs'].mode='loss')
+        x = _data.pop('inputs')
+        # print(f'data_batch:{data_batch}')
+        # print(f'data:{data}')
+        # print(f'_data:{_data}')
+        # losses = module(_data['inputs'],_data,mode='loss')
+        # assert jt.flags.use_cuda == 0
+        losses = module(x,_data,mode='loss')
+        loss_cls = losses['loss_cls']
+        loss_bbox = losses['loss_bbox']
+        loss_dfl = losses['loss_dfl']
+        # print(result)
+        # print(cls_logit[0].shape)
+        # print(cls_logit[1].shape)
+        # print(f'cls_logit:{jt.array(cls_logit)[:2].numpy()} \n bbox_preds:{bbox_preds}  \n bbox_dist_preds:{bbox_dist_preds}')
+        # loss_cls = module.loss(cls_logit[0], _data)
+        # loss_bbox = module.loss(bbox_preds[0], _data)
+        # loss_dfl = module.loss(bbox_dist_preds, _data)
+
+        loss = loss_dfl + loss_bbox + loss_cls
+        # loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
+#         print(loss)
+#         assert isinstance(loss, jt.Var)
+        optim.step(loss=loss)
+        print(
+                f'loss:{loss.numpy()} loss_cls:{loss_cls.numpy()} loss_bbox:{loss_bbox.numpy()} loss_dfl:{loss_dfl.numpy()}'
+            )
+        ema.update_parameters(module)
+
+
+# In[ ]:
+
+
+
+
+
+# In[94]:
 
 
 val_evaluator = CocoMetric(
@@ -13298,28 +15125,31 @@ val_evaluator = CocoMetric(
 
 
 
-# In[91]:
+# In[95]:
 
 
 def val(epoch):
     module.eval()
-    for data_batch in enumerate(val_dataset):
+    ema.eval()
+    for i in range(len(val_dataset)):
+        data_batch = val_dataset[i]
         if i % 50 == 0:
             print(
-                f'Epoch: {epoch} step:{i}'
+                f'Epoch(Val): {epoch +1} step:{i}'
             )
-        i = 0
         data = module.data_preprocessor(data_batch)
-        _data = yolov5_collate(*data)
-        result = moudle.predict(_data)
-        val_loss = module.loss(_data, data_batch)
-        evaluator.process(data_samples=result, data_batch=data_batch)
-        metrics = evaluator.evaluate(len(val_dataset))
+        _data = yolov5_collate(data)
         
-        loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
-        print(
-                f'loss:{loss}\n{losses}'
-            )
+        result = ema(_data['inputs'],_data,mode='predict')
+        # val_loss = module.loss(_data, data_batch)
+        val_evaluator.process(data_samples=result, data_batch=data_batch)
+        metrics = val_evaluator.evaluate(len(val_dataset))
+        
+#         loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
+#         print(
+#                 f'loss:{loss}\n{losses}'
+#             )
+        
 
 
 # In[ ]:
@@ -13335,11 +15165,25 @@ if __name__ == '__main__':
     mp.set_start_method('fork',force = True)
     # len(module)
     # len(train_dataset)
-    for i in range(10):
+    # jt.flags.use_cuda = 0
+    for epoch in range(max_epochs):
+        train(epoch)
+        # val(epoch)
 #         print('in')
-        train(i + 1)
+#         train(i + 1)
 #         print('out')
-    
+#     N,C,H,W = x.shape
+#             Kh, Kw = self.kernel_size
+
+
+# In[ ]:
+
+
+# print(train_dataset[0])
+# print(train_dataset.metainfo)
+# data = train_dataset
+# print(data)
+# train(1)
 
 
 # In[ ]:
