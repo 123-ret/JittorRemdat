@@ -2,7 +2,7 @@
 # coding: utf-8
 
 # In[1]:
-
+from enum import Enum
 import numbers
 import jittor as jt
 from jittor import nn,Module,init
@@ -15,7 +15,7 @@ from collections import defaultdict
 from jittor.dataset import Dataset
 import jittor.transform as transform
 import multiprocessing as mp
-from PIL import Image
+from PIL import Image, ImageOps
 import os
 import argparse
 import os.path as osp
@@ -119,9 +119,12 @@ jt.seed(seed)
 # Single-scale training is recommended to
 # be turned on, which can speed up training.
 
+jt.flags.lazy_execution=0
+
 # jt.flags.use_cuda = True # wait to enable done
-jt.flags.use_cuda = False
 # _device = 'cuda'
+
+jt.flags.use_cuda = False
 _device = 'cpu'
 cv2.setNumThreads(0)
 
@@ -132,15 +135,24 @@ cv2.setNumThreads(0)
 #Here are some basic settings(copied directly from the origin,fixed some parameters according to the ability of my computer)
 # ========================Frequently modified parameters======================
 # ----data related----
-data_root = '/root/.cache/jittor/dataset/Fast Test/'# '/mnt/e/git clone/UAVDT/' # Root path of data
+# data_root = '/root/.cache/jittor/dataset/Fast Test/'
+# data_root = '/mnt/e/git clone/UAVDT/' # Root path of data
 data_root = '/mnt/e/git clone/Fast Test/'
+
 # Path of train annotation file
-train_ann_file = 'ann/fast_test.json'# 'annotations/UAV-benchmark-M-Train.json'
-train_data_prefix = 'img'# 'images/UAV-benchmark-M' # Prefix of train imagae path
+train_ann_file = 'ann/fast_test.json'
+# train_ann_file = 'annotations/UAV-benchmark-M-Train.json'
+
+
+train_data_prefix = 'img'
+# train_data_prefix = 'images/UAV-benchmark-M' # Prefix of train imagae path
 
 # Path of val annotation file
-val_ann_file = 'ann/fast_test.json' # annotations/UAV-benchmark-M-Val.json'
-val_data_prefix = 'img' # 'images/UAV-benchmark-M' # Prefix of val image path
+val_ann_file = 'ann/fast_test.json' 
+# val_ann_file = 'annotations/UAV-benchmark-M-Val.json'
+
+val_data_prefix = 'img' 
+# val_data_prefix = 'images/UAV-benchmark-M' # Prefix of val image path
 
 # here we use fast test to test if the module can run normally
 # classes = ("pedestrian", "people", "bicycle", "car", "van", "truck", "tricycle", "awning-tricycle", "bus", "motor")
@@ -154,20 +166,20 @@ classes = (
 num_classes = len(classes)  # Number of classes for classification
 
 # Batch size of a single GPU during training
-train_batch_size_per_gpu = 2
+train_batch_size_per_gpu = 1
 
 # Worker to pre-fetch data for each single GPU during training
-train_num_workers = 1
+train_num_workers = 0
 
 # persistent_workers must be False if num_workers is 0
-persistent_workers = True
+persistent_workers = False
 
 # todo need to konw this parameter usage
 
 # -----train val related-----
 # Base learning rate for optim_wrapper. Corresponding to 8xb16=64 bs
 base_lr = 0.01
-max_epochs = 10  # Maximum training epochs
+max_epochs = 2  # Maximum training epochs
 # Disable mosaic augmentation for final 10 epochs (stage 2)
 close_mosaic_epochs = 1
 
@@ -202,9 +214,9 @@ img_scales = [
 # Dataset type, this will be used to define the dataset
 dataset_type = 'YOLOv5CocoDataset'
 # Batch size of a single GPU during validation
-val_batch_size_per_gpu = 2
+val_batch_size_per_gpu = 1
 # Worker to pre-fetch data for each single GPU during validation
-val_num_workers = 1
+val_num_workers = 0
 
 batch_shapes_cfg = None
 
@@ -622,7 +634,10 @@ def yolov5_collate(data_batch: Sequence,
 
 # In[ ]:
 
-
+class OptState(Enum):
+    READY = 0
+    UNSCALED = 1
+    STEPPED = 2
 
 
 
@@ -1554,14 +1569,16 @@ def blur(img: np.ndarray, ksize: int) -> np.ndarray:
     padding = (ksize // 2, ksize // 2)
     kernel = jt.ones((out_channel,in_channel,ksize,ksize)) / (ksize * ksize)
     conv = nn.Conv(
-        in_channel = in_channel,
-        out_channel = out_channel,
+        in_channels = in_channel,
+        out_channels = out_channel,
         kernel_size = kernel,
         padding = padding,
         bias = False
     )
-    conv.weight = jt.nn.Parameter(kernel, need_grad = False)
-    blurred_img = conv(array.to(jt.float32)).numpy()
+    conv.weight = jt.nn.Parameter(kernel, requires_grad = False)
+    array = array.to(jt.float32)
+    # print(f'in bluer array shape:{array.shape}')
+    blurred_img = conv(array).data
     return blurred_img
 def median_blur(img: np.ndarray, ksize: int) -> np.ndarray:
     assert ksize % 2 == 1
@@ -1580,7 +1597,7 @@ def median_blur(img: np.ndarray, ksize: int) -> np.ndarray:
     array.float()
     array = jt.sort(array, dim = -1)
     array = array[..., (ksize * ksize) // 2]
-    return array.numpy().astype(np.uint8)
+    return array.data.astype(np.uint8)
 def f(t):
     delta = 6 / 29
     return np.where( t > delta ** 3,
@@ -1861,14 +1878,6 @@ def is_seq_of(seq: Any,
 
     Returns:
         bool: Return True if ``seq`` is valid else False.
-
-    Examples:
-        >>> from mmengine.utils import is_seq_of
-        >>> seq = ['a', 'b', 'c']
-        >>> is_seq_of(seq, str)
-        True
-        >>> is_seq_of(seq, int)
-        False
     """
     if seq_type is None:
         exp_seq_type = Sequence
@@ -1956,13 +1965,15 @@ def get_shape(data: Dict[str, Any]):
             height, width = data["image"].shape[:2]
             return {"height": height, "width": width}
         else:
-            raise RuntimeError(f"Unsupported image type: {type(data["image"])}")
+            x = type(data["image"])
+            raise RuntimeError(f"Unsupported image type: {x}")
     if "images" in data:
         if isinstance(data["image"][0], np.ndarray):
             height, width = data["image"][0].shape[:2]
             return {"height": height, "width": width}
         else:
-            raise RuntimeError(f"Unsupported image type: {type(data["image"][0])}")
+            x = type(data["image"][0])
+            raise RuntimeError(f"Unsupported image type: {x}")
     raise ValueError("No image or volume found in data", data.keys())
 def samplelist_boxtype2tensor(batch_data_samples):
 #todo changed
@@ -2679,7 +2690,7 @@ class BaseDataElement:
         new_data = self.new()
         for k, v in self.items():
             if isinstance(v, (jt.Var, BaseDataElement)):
-                v = v.detach().cpu().numpy()
+                v = v.detach().data
                 data = {k: v}
                 new_data.set_data(data)
         return new_data
@@ -2942,7 +2953,10 @@ class YOLO_IoULoss(nn.Module):
         """
         if weight is not None and not jt.any(weight > 0):
             if pred.dim() == weight.dim() + 1:
+                
                 weight = weight.unsqueeze(1)
+            print(f'weight shape: {weight.shape}, pred shape: {pred.shape}')
+            #weight shape: [2,1400,1400,1,], pred shape: [15680000,4,]
             return (pred * weight).sum()  # 0
         assert reduction_override in (None, 'none', 'mean', 'sum')
         reduction = (
@@ -3287,47 +3301,7 @@ class InstanceData(BaseDataElement):
     in data field can be base data structure such as `jt.Var`, `numpy.ndarray`, `list`, `str`, `tuple`,
     and can be customized data structure that has ``__len__``, ``__getitem__`` and ``cat`` attributes.
 
-    Examples:
-        >>> # custom data structure
-        >>> class TmpObject:
-        ...     def __init__(self, tmp) -> None:
-        ...         assert isinstance(tmp, list)
-        ...         self.tmp = tmp
-        ...     def __len__(self):
-        ...         return len(self.tmp)
-        ...     def __getitem__(self, item):
-        ...         if isinstance(item, int):
-        ...             if item >= len(self) or item < -len(self):  # type:ignore
-        ...                 raise IndexError(f'Index {item} out of range!')
-        ...             else:
-        ...                 # keep the dimension
-        ...                 item = slice(item, None, len(self))
-        ...         return TmpObject(self.tmp[item])
-        ...     @staticmethod
-        ...     def cat(tmp_objs):
-        ...         assert all(isinstance(results, TmpObject) for results in tmp_objs)
-        ...         if len(tmp_objs) == 1:
-        ...             return tmp_objs[0]
-        ...         tmp_list = [tmp_obj.tmp for tmp_obj in tmp_objs]
-        ...         tmp_list = list(itertools.chain(*tmp_list))
-        ...         new_data = TmpObject(tmp_list)
-        ...         return new_data
-        ...     def __repr__(self):
-        ...         return str(self.tmp)
-        >>> from mmengine.structures import InstanceData
-        >>> import numpy as np
-        >>> import torch
-        >>> img_meta = dict(img_shape=(800, 1196, 3), pad_shape=(800, 1216, 3))
-        >>> instance_data = InstanceData(metainfo=img_meta)
-        >>> 'img_shape' in instance_data
-        True
-        >>> instance_data.det_labels = jt.LongTensor([2, 3])
-        >>> instance_data["det_scores"] = jt.Var([0.8, 0.7])
-        >>> instance_data.bboxes = jt.rand((2, 4))
-        >>> instance_data.polygons = TmpObject([[1, 2, 3, 4], [5, 6, 7, 8]])
-        >>> len(instance_data)
-        2
-        >>> print(instance_data)
+
         <InstanceData(
             META INFORMATION
             img_shape: (800, 1196, 3)
@@ -3464,23 +3438,23 @@ class InstanceData(BaseDataElement):
         new_data = self.__class__(metainfo=self.metainfo)
         if isinstance(item, jt.Var):
             assert item.dim() == 1, 'Only support to get the'                                     ' values along the first dimension.'
-            if isinstance(item, jt.bool):
+            if item.dtype is jt.bool:
                 assert len(item) == len(self), 'The shape of the '                                                'input(BoolTensor) '                                                f'{len(item)} '                                                'does not match the shape '                                                'of the indexed tensor '                                                'in results_field '                                                f'{len(self)} at '                                                'first dimension.'
 
             for k, v in self.items():
                 if isinstance(v, jt.Var):
                     new_data[k] = v[item]
                 elif isinstance(v, np.ndarray):
-                    new_data[k] = v[item.cpu().numpy()]
+                    new_data[k] = v[item.data]
                 elif isinstance(
                         v, (str, list, tuple)) or (hasattr(v, '__getitem__')
                                                    and hasattr(v, 'cat')):
                     # convert to indexes from BoolTensor
-                    if isinstance(item, jt.bool):
-                        indexes = jt.nonzero(item).view(
-                            -1).cpu().numpy().tolist()
+                    if item.dtype is jt.bool:
+                        indexes = list(jt.nonzero(item).view(
+                            -1).data)
                     else:
-                        indexes = item.cpu().numpy().tolist()
+                        indexes = list(item.data)
                     slice_list = []
                     if indexes:
                         for index in indexes:
@@ -3895,7 +3869,7 @@ class PackDetInputs:
             else:
                 img = to_tensor(img).permute(2, 0, 1).contiguous()
 
-            packed_results['inputs'] = img.numpy()
+            packed_results['inputs'] = img.data
 
         if 'gt_ignore_flags' in results:
             valid_idx = np.where(results['gt_ignore_flags'] == 0)[0]
@@ -4665,8 +4639,9 @@ class EMA(Module):
             self.module = deepcopy(model)
             # self.module = module.clone().need_grad_(False)
             self.interval = interval
-            self.register_buffer('steps',
-                                 jt.array(0))
+            # self.register_buffer('steps',
+            #                      jt.array(0))
+            self.steps = jt.array(0)
             self.update_buffers = update_buffers
             if update_buffers:
                 self.avg_parameters = self.module.state_dict()
@@ -4687,9 +4662,27 @@ class EMA(Module):
             dict(model.named_parameters()))
         if self.steps == 0:
             for k, p_avg in self.avg_parameters.items():
-                # print(f'type(src_parameters[k].data):{type(src_parameters[k].data)}')
-                # print(f'type(p_avg.data):{type(p_avg.data)}')
-                src_parameters[k].data = p_avg.data.copy()
+                # print(f'before print 0')
+                # m = src_parameters[k].data.copy()
+                # _device = m.device
+                # print(f'before print')
+                # print(f'type(src_parameters[k].data):{type(m)}')
+                
+                # print(f'type(p_avg.data):{type(a)}')
+                # print('before copy')
+                
+                # print('after copy')
+                # a = a.to(src_parameters[k].device)
+                # print('after to device')
+                # print()
+                # a = p_avg.data.copy()
+                # # print('after copy')
+                # a = jt.array(a,dtype=src_parameters[k].dtype)
+                # print('after array')
+                jt.array(src_parameters[k].data).update(p_avg.data)
+                # print('before assign')
+                # m = a
+                
         elif self.steps % self.interval == 0:
             for k, p_avg in self.avg_parameters.items():
                 if p_avg.dtype.is_floating_point:
@@ -4707,9 +4700,11 @@ class EMA(Module):
 #                 b_avg.data.copy(b_src.data.to(b_avg.device))
 #                 b_src.data = jt.copy(b_avg.data)
 #                 b_src.data = jt.array(b_src.data)
-                x = b_avg.data.copy()
+                # print('before copy buffer')
+                # x = b_avg.data.copy()
+                # print('before assign buffer')
                 # print(f'type(b_src.data):{type(b_src.data)}')
-                jt.array(b_src.data).assign(x)
+                jt.array(b_src.data).update(b_avg.data)
         self.steps += 1
     def avg_func(self, averaged_param: jt.Var, source_param: jt.Var,
                  steps: int) -> None:
@@ -4724,7 +4719,7 @@ class EMA(Module):
         """
         momentum = (1 - self.momentum) * math.exp(
             -float(1 + steps) / self.gamma) + self.momentum
-        averaged_param.assign_(averaged_param * (1 - momentum) + source_param * momentum)
+        jt.array(averaged_param).update(averaged_param * (1 - momentum) + source_param * momentum)
 
 
 # In[ ]:
@@ -5084,22 +5079,26 @@ class BboxProcessor:
         """
         shape = get_shape(data)
         # print(f'in preprocess data: {data}')
-        for data_name in set(self.data_fields) & set(data.keys()):  # Convert list of lists to numpy array if necessary
-            if isinstance(data[data_name], Sequence):
-                # print(print(f'data[{data_name}]: {data[data_name]}'))
-                self.is_sequence_input[data_name] = True
-                data[data_name] = np.array(data[data_name], dtype=np.float32)
-                # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
-            else:
-                self.is_sequence_input[data_name] = False
-                # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
-        # raise NotImplementedError()
+        mm = set(data.keys()) if data is not None else None
+        if mm is not None:
+            for data_name in set(self.data_fields) & mm:  # Convert list of lists to numpy array if necessary
+                if isinstance(data[data_name], Sequence):
+                    # print(print(f'data[{data_name}]: {data[data_name]}'))
+                    self.is_sequence_input[data_name] = True
+                    data[data_name] = np.array(data[data_name], dtype=np.float32)
+                    # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
+                else:
+                    self.is_sequence_input[data_name] = False
+                    # print(print(f'data[{data_name}]: {data[data_name]}, self.is_sequence_input:{self.is_sequence_input[data_name]}'))
+            # raise NotImplementedError()
         data = self.add_label_fields_to_data(data)
         # print(f'after data: {data}')
-        for data_name in set(self.data_fields) & set(data.keys()):
-            # print(f'data[data_name]: {data[data_name]}')
-            # raise NotImplementedError()
-            data[data_name] = self.check_and_convert(data[data_name], shape, direction="to")
+        mm = set(data.keys()) if data is not None else None
+        if mm is not None:
+            for data_name in set(self.data_fields) & mm:
+                # print(f'data[data_name]: {data[data_name]}')
+                # raise NotImplementedError()
+                data[data_name] = self.check_and_convert(data[data_name], shape, direction="to")
     def add_label_fields_to_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Add label fields to data arrays.
 
@@ -5848,9 +5847,9 @@ class Compose:
             # bbox = data.get("bbox", None)
             # print(f'data.bbox:{bbox}')
             # print(f'data:{data}')
-            if t.__class__ is type:
-                continue
-#             print(f'will in {t.__class__}')
+            # if t.__class__ is type:
+            #     continue
+            # print(f'will in {t.__class__}')
             data = t(results = data)
             # print(data.get('img',data))
             # if not a:
@@ -7185,7 +7184,7 @@ class YOLOv5KeepRatioResize:
 #                     results['img_shape'])
 
                 results['gt_masks'] = (transform.resize(img=results['gt_masks'],
-                                                       size=results['img_shape'])).numpy()
+                                                       size=results['img_shape'])).data
                                       
     def _resize_bboxes(self, results: dict) -> None:
         """Resize bounding boxes with ``results['scale_factor']``."""
@@ -8326,7 +8325,8 @@ class ConvModule(Module):
         layer_index = 0
 #         print(x)
 #         print(x.shape)
-        x.to(jt.float32)
+        x = x.to(jt.float32)
+        # print(f'in {self.__class__},type of x is {x.dtype}')
         while layer_index < len(self.order):
             layer = self.order[layer_index]
             if layer == 'conv':
@@ -8623,7 +8623,8 @@ class RepDWConv(Module):
         Returns:
             Tensor: The output tensor.
         """
-        inputs.to(jt.float32)
+        inputs = inputs.to(jt.float32)
+        # print(f'in {self.__class__},type of x is {inputs.dtype}')
         if hasattr(self, 'rbr_reparam'):
             return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
 
@@ -9381,6 +9382,8 @@ class RemNet(Module):
 # #                 N,C,H,W = x.shape
 # #                 Kh, Kw = self.kernel_size
 #                 print(layer)
+            x = x.to(jt.float32)
+            # print(f'in {self.__class__},type of x is {x.dtype}')
             x = layer(x)
 #             print(f'in {self.__class__}')
 #             print(x.shape)
@@ -9681,35 +9684,37 @@ def distance2bbox(
     y2 = points[..., 1] + distance[..., 3]
 
     bboxes = jt.stack([x1, y1, x2, y2], -1)
-
+    # print(f'bboxes:{bboxes.data}')
+    # print(f'max_shape:{max_shape.data}')
     if max_shape is not None:
-        if bboxes.dim() == 2 and not jt.onnx.is_exporting():
+        if bboxes.dim() == 2:
             # speed up
-            bboxes[:, 0::2].clamp_(min=0, max=max_shape[1])
-            bboxes[:, 1::2].clamp_(min=0, max=max_shape[0])
+            bboxes[:, 0::2].clamp_(min_v=0, max_v=max_shape[1])
+            bboxes[:, 1::2].clamp_(min_v=0, max_v=max_shape[0])
             return bboxes
 
         # clip bboxes with dynamic `min` and `max` for onnx
-        if jt.onnx.is_exporting():
-            raise NotImplementedError
+        # if jt.onnx.is_exporting():
+        #     raise NotImplementedError
             # TODO: delete
 #             from mmdet.core.export import dynamic_clip_for_onnx
 #             x1, y1, x2, y2 = dynamic_clip_for_onnx(x1, y1, x2, y2, max_shape)
 #             bboxes = jt.stack([x1, y1, x2, y2], dim=-1)
 #             return bboxes
         if not isinstance(max_shape, jt.Var):
-            max_shape = x1.like(max_shape)
-        max_shape = max_shape[..., :2].type_as(x1)
+            max_shape = jt.array(max_shape, dtype = x1.dtype).reshape(x1.shape)
+        max_shape = jt.type_as(max_shape[..., :2],x1)
         if max_shape.ndim == 2:
             assert bboxes.ndim == 3
             assert max_shape.size(0) == bboxes.size(0)
 
-        min_xy = x1.like(0)
+        min_xy = jt.zeros_like(x1)
         max_xy = jt.cat([max_shape, max_shape],
                            dim=-1).flip(-1).unsqueeze(-2)
         bboxes = jt.where(bboxes < min_xy, min_xy, bboxes)
+        # print(f'bboxes:{bboxes.data}')
         bboxes = jt.where(bboxes > max_xy, max_xy, bboxes)
-
+        # print(f'bboxes:{bboxes.data}')
     return bboxes
 
 
@@ -9742,10 +9747,10 @@ def bbox2distance(points: jt.Var,
     right = bbox[..., 2] - points[..., 0]
     bottom = bbox[..., 3] - points[..., 1]
     if max_dis is not None:
-        left = left.clamp(min=0, max=max_dis - eps)
-        top = top.clamp(min=0, max=max_dis - eps)
-        right = right.clamp(min=0, max=max_dis - eps)
-        bottom = bottom.clamp(min=0, max=max_dis - eps)
+        left = left.clamp(min_v=0, max_v=max_dis - eps)
+        top = top.clamp(min_v=0, max_v=max_dis - eps)
+        right = right.clamp(min_v=0, max_v=max_dis - eps)
+        bottom = bottom.clamp(min_v=0, max_v=max_dis - eps)
     return jt.stack([left, top, right, bottom], -1)
 
 
@@ -9810,7 +9815,8 @@ class YOLODistancePointBBoxCoder:
             stride = jt.array(scaled_stride).squeeze(dim=1)
 #             print(jt.array(stride).shape)
         pred_bboxes = pred_bboxes * stride[None, :, None]
-#         raise NotImplementedError('debug debug')
+        # print(f'pred_bboxes:{pred_bboxes.data}')
+        # raise NotImplementedError('debug debug')
         return distance2bbox(points, pred_bboxes, max_shape)
 
     def encode(self,
@@ -10319,8 +10325,8 @@ def nms(boxes: Any,
                        
     dets = jt.cat((boxes[inds], scores[inds].reshape(-1, 1)), dim=1)
     if is_numpy:
-        dets = dets.cpu().numpy()
-        inds = inds.cpu().numpy()
+        dets = dets.data
+        inds = inds.data
     return dets, inds
 
 
@@ -10485,15 +10491,19 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
         jt.Var: batch gt instances data, shape
                 [batch_size, number_gt, box_dim+1]
     """
+    # print(f'batch_gt_instances:{batch_gt_instances.data}')
     if isinstance(batch_gt_instances, Sequence):
         max_gt_bbox_len = max(
             [len(gt_instances) for gt_instances in batch_gt_instances])
         # fill zeros with length box_dim+1 if some shape of
         # single batch not equal max_gt_bbox_len
+        # print(f'max_gt_bbox_len:{max_gt_bbox_len}')
         batch_instance_list = []
         for index, gt_instance in enumerate(batch_gt_instances):
             bboxes = gt_instance.bboxes
             labels = gt_instance.labels
+            # print(f'bboxes:{bboxes.data}')
+            # print(f'labels:{labels.data}')
             box_dim = jt.array(bboxes).size(-1)
             batch_instance_list.append(
                 jt.cat((labels[:, None], bboxes), dim=-1))
@@ -10505,7 +10515,7 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
                 [max_gt_bbox_len - bboxes.shape[0], box_dim + 1], 0)
             batch_instance_list[index] = jt.cat(
                 (batch_instance_list[index], fill_tensor), dim=0)
-
+        raise RuntimeError('test')
         return jt.stack(batch_instance_list)
     else:
         # faster version
@@ -10517,12 +10527,14 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
 
         # sqlit batch gt instance [all_gt_bboxes, box_dim+2] ->
         # [batch_size, max_gt_bbox_len, box_dim+1]
+        # raise NotImplementedError('test')
         assert isinstance(batch_gt_instances, jt.Var)
         box_dim = batch_gt_instances.size(-1) - 2
         if len(batch_gt_instances) > 0:
-#             print(batch_gt_instances)
+            # print(f'batch_gt_instances:{batch_gt_instances.data}')
             gt_images_indexes = batch_gt_instances[:, 0]
-#             print(f'gt_images_indexes:{gt_images_indexes.numpy()}')
+
+            # print(f'gt_images_indexes:{gt_images_indexes.numpy()}')
 #             print(f'gt_images_indexes.unique():{gt_images_indexes.unique().numpy()}')
 #             print(f'gt_images_indexes.unique(return_counts=True):{gt_images_indexes.unique(return_counts=True).numpy()}')
 #             print(f'gt_images_indexes.unique(return_counts=True)[1]:{gt_images_indexes.unique(return_counts=True)[1].numpy()}')
@@ -10532,11 +10544,13 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
             # gt_images_indexes.unique(return_counts=True):[1. 1.]
             # gt_images_indexes.unique(return_counts=True)[1]:[1.]
             # maybe jittor not supports this well, change to numpy
-            gt_images_indexes = gt_images_indexes.numpy()
+            gt_images_indexes = gt_images_indexes.data
 #             max_gt_bbox_len = gt_images_indexes.unique(
 #                 return_counts=True)[1].max()
+            # print(f'np.unique(gt_images_indexes,return_counts=True):{np.unique(gt_images_indexes,return_counts=True)}')
             max_gt_bbox_len = np.unique(gt_images_indexes,
                 return_counts=True)[1].max()
+            # print(f'max_gt_bbox_len:{max_gt_bbox_len}')
 #             max_gt_bbox_len = jt.unique(gt_images_indexes,
 #                 return_counts=True)[1].max() + 1
             # fill zeros with length box_dim+1 if some shape of
@@ -10552,8 +10566,9 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
 
 #             batch_instance = batch_instance.numpy()
             batch_gt_instances = jt.array(batch_gt_instances)
+            # print(f'batch_gt_instances:{batch_gt_instances.data}')
             for i in range(batch_size):
-                match_indexes = gt_images_indexes == i
+                match_indexes = gt_images_indexes == (i + 1)
                 gt_num = match_indexes.sum()
 #                 print(i)
 #                 print(batch_size)
@@ -10569,13 +10584,14 @@ def gt_instances_preprocess(batch_gt_instances: Union[jt.Var, Sequence],
 #                     print(f'batch_instance.shape:{batch_instance.shape}')
                     batch_instance[i, :gt_num] = batch_gt_instances[
                         jt.array(match_indexes), 1:]
+                    # print(f'batch_instance:{batch_instance.data}')
 #             raise NotImplementedError('test shape')
 #             batch_instance = jt.array(batch_instance)
         else:
             batch_instance = jt.zeros((batch_size, 0, box_dim + 1),
                                          dtype=batch_gt_instances.dtype,)
 #                                          device=batch_gt_instances.device)
-
+        # raise RuntimeError('test')
         return batch_instance
 
 
@@ -10713,6 +10729,7 @@ class YOLOv8Head(Module):
 
         self.special_init()
 #         self.loss_dfl = MODELS.build(loss_dfl)
+        self.loss_dfl = loss_dfl
         # YOLOv8 doesn't need loss_obj
         self.loss_obj = None
         
@@ -10769,27 +10786,31 @@ class YOLOv8Head(Module):
             dict[str, jt.Var]: A dictionary of losses.
         """
         num_imgs = len(batch_img_metas)
-
+        # print(f'in {self.__class__}.loss_by_feat')
         current_featmap_sizes = [
             cls_score.shape[2:] for cls_score in cls_scores
         ]
         # If the shape does not equal, generate new one
         if current_featmap_sizes != self.featmap_sizes_train:
+            # print(f'current_featmap_sizes:{current_featmap_sizes}')
+            # print(f'self.featmap_sizes_train:{self.featmap_sizes_train}')
             self.featmap_sizes_train = current_featmap_sizes
-
-            mlvl_priors_with_stride = self.prior_generator.grid_priors( #todo
+            # print(f'in {self.__class__} before self.prior_generator')
+            mlvl_priors_with_stride = self.prior_generator.grid_priors( 
                 self.featmap_sizes_train,
                 dtype=cls_scores[0].dtype,
 #                 device=cls_scores[0]c,
                 with_stride=True)
-
+            
             self.num_level_priors = [len(n) for n in mlvl_priors_with_stride]
             self.flatten_priors_train = jt.cat(
                 mlvl_priors_with_stride, dim=0)
             self.stride_tensor = self.flatten_priors_train[..., [2]]
 
         # gt info
+        # print(f'befor gt_instances_preprocess')
         gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
+        # print(f'\n gt_info:{gt_info.data}')
         gt_labels = gt_info[:, :, :1]
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
@@ -10800,10 +10821,12 @@ class YOLOv8Head(Module):
                                                  self.num_classes)
             for cls_pred in cls_scores
         ]
+
         flatten_pred_bboxes = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
         ]
+
         # (bs, n, 4 * reg_max)
         flatten_pred_dists = [
             bbox_pred_org.reshape(num_imgs, -1, self.head_module.reg_max * 4) #todo
@@ -10813,21 +10836,27 @@ class YOLOv8Head(Module):
         flatten_dist_preds = jt.cat(flatten_pred_dists, dim=1)
         flatten_cls_preds = jt.cat(flatten_cls_preds, dim=1)
         flatten_pred_bboxes = jt.cat(flatten_pred_bboxes, dim=1)
+        # print(f'in {self.__class__},befor decode')
+        # print(f'flatten_pred_bboxes:{flatten_pred_bboxes.data}')
+        # print(f'flatten_dist_preds:{flatten_dist_preds.data}')
         flatten_pred_bboxes = self.bbox_coder.decode( #todo
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
 #         t_type = gt_bboxes.dtype
 #         assert str(gt_bboxes.dtype) == 'float32',f'gt_bboxes.dtype:{gt_bboxes.dtype}'
+        # print(f'in {self.__class__},befor assiger')
+        # print(f'flatten_pred_bboxes:{flatten_pred_bboxes.data}')
         assigned_result = self.assigner(
             jt.array((flatten_pred_bboxes.detach()),dtype = jt.array(gt_bboxes).dtype),
             flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
             gt_labels, gt_bboxes, pad_bbox_flag)
-
+        # print(f'assigned_result:{assigned_result}')
         assigned_bboxes = assigned_result['assigned_bboxes']
         assigned_scores = assigned_result['assigned_scores']
         fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
 
         assigned_scores_sum = assigned_scores.sum().clamp(min_v=1)
+        # print(f'before loss_cls')
 
         loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
         loss_cls /= assigned_scores_sum
@@ -10838,21 +10867,32 @@ class YOLOv8Head(Module):
 
         # select positive samples mask
         num_pos = fg_mask_pre_prior.sum()
-        if num_pos > 0:
+        # print(f'num_pos = {num_pos.data}')
+        # assert num_pos > 0
+        # if num_pos > 0:
+        if True:
             # when num_pos > 0, assigned_scores_sum will >0, so the loss_bbox
             # will not report an error
             # iou loss
             prior_bbox_mask = fg_mask_pre_prior.unsqueeze(-1).repeat([1, 1, 4])
-            pred_bboxes_pos = jt.masked_select(
-                flatten_pred_bboxes, prior_bbox_mask).reshape([-1, 4])
-            assigned_bboxes_pos = jt.masked_select(
-                assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
-            bbox_weight = jt.masked_select(
-                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+            pred_bboxes_pos = flatten_pred_bboxes[prior_bbox_mask].reshape([-1, 4])
+            assigned_bboxes_pos = assigned_bboxes[prior_bbox_mask].reshape([-1, 4])
+            bbox_weight = assigned_scores.sum(-1)[fg_mask_pre_prior].unsqueeze(-1)
+            # pred_bboxes_pos = jt.masked_select(
+            #     flatten_pred_bboxes, prior_bbox_mask).reshape([-1, 4])
+            # assigned_bboxes_pos = jt.masked_select(
+            #     assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
+            # bbox_weight = jt.masked_select(
+            #     assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+            # print(f'before loss_bbox')
+            # print(f'pred_bboxes_pos:{pred_bboxes_pos.data}')
+            # print(f'assigned_bboxes_pos:{assigned_bboxes_pos.data}')
+            # print(f'bbox_weight:{bbox_weight.data}')
+            # print(f'assigned_scores_sum:{assigned_scores_sum}')
             loss_bbox = self.loss_bbox(
                 pred_bboxes_pos, assigned_bboxes_pos,
                 weight=bbox_weight) / assigned_scores_sum
-
+            # print(f'loss_bbox:{loss_bbox}')
             # dfl loss
             pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
             assigned_ltrb = self.bbox_coder.encode( 
@@ -10860,8 +10900,8 @@ class YOLOv8Head(Module):
                 assigned_bboxes,
                 max_dis=self.head_module.reg_max - 1,
                 eps=0.01)
-            assigned_ltrb_pos = jt.masked_select(
-                assigned_ltrb, prior_bbox_mask).reshape([-1, 4])
+            assigned_ltrb_pos = assigned_ltrb[prior_bbox_mask].reshape([-1, 4])
+            # print(f'before loss_dfl')
             loss_dfl = self.loss_dfl(
                 pred_dist_pos.reshape(-1, self.head_module.reg_max),
                 assigned_ltrb_pos.reshape(-1),
@@ -10871,6 +10911,7 @@ class YOLOv8Head(Module):
             loss_bbox = flatten_pred_bboxes.sum() * 0
             loss_dfl = flatten_pred_bboxes.sum() * 0
         world_size = 1
+        # print(f'in {self.__class__},back')
         return dict(
             loss_cls=loss_cls * num_imgs * world_size,
             loss_bbox=loss_bbox * num_imgs * world_size,
@@ -11160,7 +11201,7 @@ class YOLOv8Head(Module):
             loss_inputs = outs + (batch_data_samples['data_samples']['bboxes_labels'],
                                   batch_data_samples['img_metas'])
             losses = self.loss_by_feat(*loss_inputs)
-
+        # print(f'\n in {self.__class__} return losses:{losses}')
         return losses
     def _bbox_post_process(self,
                            results: InstanceData,
@@ -11224,7 +11265,8 @@ class YOLOv8Head(Module):
             results = results[keep_idxs]
             # some nms would reweight the score, such as softnms
             results.scores = det_bboxes[:, -1]
-            results = results[:cfg.max_per_img]
+            # print(f'cfg:{cfg}')
+            results = results[:cfg['max_per_img']]
 
         return results
 
@@ -11385,7 +11427,8 @@ class YOLOv8HeadModule(Module):
                        reg_pred: nn.ModuleList) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = x.shape
-        x.to(jt.float32)
+        x = x.to(jt.float32)
+        # print(f'in {self.__class__}.forward_single,x.type:{x.dtype}')
         cls_logit = cls_pred(x)
         bbox_dist_preds = reg_pred(x)
         if self.reg_max > 1:
@@ -11526,15 +11569,25 @@ class BatchTaskAlignedAssigner(nn.Module):
         pos_mask, alignment_metrics, overlaps = self.get_pos_mask(
             pred_bboxes, pred_scores, priors, gt_labels, gt_bboxes,
             pad_bbox_flag, batch_size, num_gt)
-
+        
+        # print('\n fixed to test')
+        # overlaps += 0.5
+        # alignment_metrics += 1.0
+        # print(f'pos_mask:{pos_mask.data}')
+        # print(f'alignment_metrics:{alignment_metrics.data}')
+        # print(f'overlaps:{overlaps.data}')
         (assigned_gt_idxs, fg_mask_pre_prior,
          pos_mask) = select_highest_overlaps(pos_mask, overlaps, num_gt)
-
+        # print(f'assigned_gt_idxs:{assigned_gt_idxs.data}')
+        # print(f'fg_mask_pre_prior:{fg_mask_pre_prior.data}')
+        # print(f'pos_mask:{pos_mask.data}')
         # assigned target
         assigned_labels, assigned_bboxes, assigned_scores = self.get_targets(
             gt_labels, gt_bboxes, assigned_gt_idxs, fg_mask_pre_prior,
             batch_size, num_gt)
-
+        # print(f'assigned_labels:{assigned_labels.data}')
+        # print(f'assigned_bboxes:{assigned_bboxes.data}')
+        # print(f'assigned_scores:{assigned_scores.data}')
         # normalize
         alignment_metrics *= pos_mask
         pos_align_metrics = alignment_metrics.max(dim=-1, keepdim=True)[0]
@@ -11543,6 +11596,10 @@ class BatchTaskAlignedAssigner(nn.Module):
             alignment_metrics * pos_overlaps /
             (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
         assigned_scores = assigned_scores * norm_align_metric
+        # print(f'norm_align_metric:{norm_align_metric.data}')
+        # print(f'assigned_scores after norm:{assigned_scores.data}')
+
+#         print(f'assigned_result:{assigned_result}')
 #         print(f'assigned_labels.shape:{assigned_labels.shape}')
 #         print(f'assigned_bboxes.shape:{assigned_bboxes.shape}')
 #         print(f'assigned_scores.shape:{assigned_scores.shape}')
@@ -11557,10 +11614,15 @@ class BatchTaskAlignedAssigner(nn.Module):
 #                 fg_mask_pre_prior (Tensor): Force ground truth matching mask,\
 #                     shape(batch_size, num_priors)')
 #         raise NotImplementedError('during debugging')
-        assigned_result['assigned_labels'] = assigned_labels
-        assigned_result['assigned_bboxes'] = assigned_bboxes
-        assigned_result['assigned_scores'] = assigned_scores
-        assigned_result['fg_mask_pre_prior'] = fg_mask_pre_prior.bool()
+#jump1
+        # assigned_scores += jt.normal(mean=0.0,std=1,size=assigned_scores.shape)
+        # assigned_scores = assigned_scores.clamp(min_v = 0)
+        # flip_mask = jt.rand(fg_mask_pre_prior.shape) < 0.2
+        # fg_mask_pre_prior = fg_mask_pre_prior.bool() ^ flip_mask
+        # assigned_result['assigned_labels'] = assigned_labels
+        # assigned_result['assigned_bboxes'] = assigned_bboxes
+        # assigned_result['assigned_scores'] = assigned_scores
+        # assigned_result['fg_mask_pre_prior'] = fg_mask_pre_prior.bool()
         return assigned_result
 
     def get_pos_mask(self, pred_bboxes: jt.Var, pred_scores: jt.Var,
@@ -11596,10 +11658,12 @@ class BatchTaskAlignedAssigner(nn.Module):
         # Compute alignment metric between all bbox and gt
         alignment_metrics, overlaps =  self.get_box_metrics(pred_bboxes, pred_scores, gt_labels,
                                  gt_bboxes, batch_size, num_gt)
+        # print(f'alignment_metrics:{alignment_metrics.data}')
+        # print(f'overlaps:{overlaps.data}')
 
         # get is_in_gts mask
         is_in_gts = select_candidates_in_gts(priors, gt_bboxes)
-
+        # print(f'is_in_gts:{is_in_gts.data}')
         # get topk_metric mask
 #         pad_bbox_flag = pad_bbox_flag.numpy()
 #         print(f'pad_bbox_flag:{pad_bbox_flag.numpy()}')
@@ -11609,7 +11673,7 @@ class BatchTaskAlignedAssigner(nn.Module):
         topk_metric = self.select_topk_candidates(
             alignment_metrics * is_in_gts,
             topk_mask=pad_bbox_flag.repeat([1, 1, int(self.topk)]).bool())
-
+        # print(f'topk_metric:{topk_metric.data}')
         # merge all mask to a final mask
         pad_bbox_flag = jt.array(pad_bbox_flag)
         pos_mask = topk_metric * is_in_gts * pad_bbox_flag
@@ -11643,6 +11707,13 @@ class BatchTaskAlignedAssigner(nn.Module):
         idx[0] = jt.arange(end=batch_size).view(-1, 1).repeat(1, num_gt)
         idx[1] = gt_labels.squeeze(-1)
         bbox_scores = pred_scores[idx[0], idx[1]]
+        # print(f'bbox_scores:{bbox_scores.data}')
+        # print(f'pred_bboxes:{pred_bboxes.data}')
+
+        # print(f'gt_bboxes:{gt_bboxes.data}')
+        # print(f'pred_bboxes.shape:{pred_bboxes.shape},should be (batch_size, num_priors, 4)')
+        # print(f'gt_bboxes.shape:{gt_bboxes.shape},should be (batch_size, num_gt, 4)')
+        # print(f'bbox_scores.shape:{bbox_scores.shape},should be (batch_size, num_gt, num_priors)')
         # TODO: need to replace the yolov6_iou_calculator function
         if self.use_ciou:
             overlaps = yolo_bbox_overlaps(
@@ -11653,7 +11724,7 @@ class BatchTaskAlignedAssigner(nn.Module):
         else:
             raise NotImplementedError
 #             overlaps = yolov6_iou_calculator(gt_bboxes, pred_bboxes)
-
+        # print(f'overlaps:{overlaps.data}')
         alignment_metrics = bbox_scores.pow(self.alpha) * overlaps.pow(
             self.beta)
 
@@ -11880,9 +11951,11 @@ class YOLODetector(nn.Module):
         else:
             raise RuntimeError(f'Invalid mode "{mode}". '
                                'Only supports loss, predict and tensor mode')
+
     def loss(self, batch_inputs: jt.Var,
              batch_data_samples) -> Union[dict, list]:
         """Calculate losses from a batch of inputs and data samples.
+
 
         Args:
             batch_inputs (jt.Var): Input images of shape (N, C, H, W).
@@ -11894,8 +11967,11 @@ class YOLODetector(nn.Module):
         Returns:
             dict: A dictionary of loss components.
         """
+        # print(f'in {self.__class__}.loss,before extract_feat')
         x = self.extract_feat(batch_inputs)
+        # print(f'in {self.__class__}.loss,after extract_feat')
         losses = self.bbox_head.loss(x, batch_data_samples)
+        # print(f'\n in {self.__class__} return')
         return losses
 
     def predict(self,
@@ -11952,6 +12028,7 @@ class YOLODetector(nn.Module):
         x = self.extract_feat(batch_inputs)
         results = self.bbox_head.execute(x)
         return results
+    
     def extract_feat(self, batch_inputs: jt.Var) -> Tuple[jt.Var]:
         """Extract features.
 
@@ -11966,6 +12043,7 @@ class YOLODetector(nn.Module):
         if self.with_neck:
             x = self.neck(x)
         return x
+    
     def add_pred_to_datasample(self, data_samples,
                                results_list):
         """Add predictions to `DetDataSample`.
@@ -12007,593 +12085,676 @@ class YOLODetector(nn.Module):
 
 # In[74]:
 
-
+# raise RuntimeError('TODO: this could not solve nan,need to change')
+# notice this is not so good choose to write another
 # python/jtorch/gradscaler.py
 #due to no know how to interact with jittor.optimizer so copied
 # copied directly from https://github.com/JITTorch/jtorch/blob/master/python/jtorch/gradscaler.py
-def _refresh_per_optimizer_state():
-    return {}
+# def _refresh_per_optimizer_state():
+#     return {}
+# class GradScaler:
+#
+#     _scale: Optional[jt.Var]
+#     _grows_tracker: Optional[jt.Var]
+#     _per_optimizer_states: Dict[int, Dict[str, Any]]
+#     """
+#     An instance ``scaler`` of :class:`GradScaler` helps perform the steps of gradient scaling
+#     conveniently.
+#
+#     * ``scaler.scale(loss)`` multiplies a given loss by ``scaler``'s current scale factor.
+#     * ``scaler.step(optimizer)`` safely unscales gradients and calls ``optimizer.step()``.
+#     * ``scaler.update()`` updates ``scaler``'s scale factor.
+#
+#     Example::
+#
+#         # Creates a GradScaler once at the beginning of training.
+#         scaler = GradScaler()
+#
+#         for epoch in epochs:
+#             for input, target in data:
+#                 optimizer.zero_grad()
+#                 output = model(input)
+#                 loss = loss_fn(output, target)
+#
+#                 # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
+#                 scaler.scale(loss).backward()
+#
+#                 # scaler.step() first unscales gradients of the optimizer's params.
+#                 # If gradients don't contain infs/NaNs, optimizer.step() is then called,
+#                 # otherwise, optimizer.step() is skipped.
+#                 scaler.step(optimizer)
+#
+#                 # Updates the scale for next iteration.
+#                 scaler.update()
+#
+#     See the :ref:`Automatic Mixed Precision examples<amp-examples>` for usage
+#     (along with autocasting) in more complex cases like gradient clipping, gradient accumulation, gradient penalty,
+#     and multiple losses/optimizers.
+#
+#     ``scaler`` dynamically estimates the scale factor each iteration.  To minimize gradient underflow,
+#     a large scale factor should be used.  However, ``float16`` values can "overflow" (become inf or NaN) if
+#     the scale factor is too large.  Therefore, the optimal scale factor is the largest factor that can be used
+#     without incurring inf or NaN gradient values.
+#     ``scaler`` approximates the optimal scale factor over time by checking the gradients for infs and NaNs during every
+#     ``scaler.step(optimizer)`` (or optional separate ``scaler.unscale_(optimizer)``, see :meth:`unscale_`).
+#
+#     * If infs/NaNs are found, ``scaler.step(optimizer)`` skips the underlying ``optimizer.step()`` (so the params
+#       themselves remain uncorrupted) and ``update()`` multiplies the scale by ``backoff_factor``.
+#
+#     * If no infs/NaNs are found, ``scaler.step(optimizer)`` runs the underlying ``optimizer.step()`` as usual.
+#       If ``growth_interval`` unskipped iterations occur consecutively, ``update()`` multiplies the scale by
+#       ``growth_factor``.
+#
+#     The scale factor often causes infs/NaNs to appear in gradients for the first few iterations as its
+#     value calibrates.  ``scaler.step`` will skip the underlying ``optimizer.step()`` for these
+#     iterations.  After that, step skipping should occur rarely (once every few hundred or thousand iterations).
+#
+#     Args:
+#         init_scale (float, optional, default=2.**16):  Initial scale factor.
+#         growth_factor (float, optional, default=2.0):  Factor by which the scale is multiplied during
+#             :meth:`update` if no inf/NaN gradients occur for ``growth_interval`` consecutive iterations.
+#         backoff_factor (float, optional, default=0.5):  Factor by which the scale is multiplied during
+#             :meth:`update` if inf/NaN gradients occur in an iteration.
+#         growth_interval (int, optional, default=2000):  Number of consecutive iterations without inf/NaN gradients
+#             that must occur for the scale to be multiplied by ``growth_factor``.
+#         enabled (bool, optional):  If ``False``, disables gradient scaling. :meth:`step` simply
+#             invokes the underlying ``optimizer.step()``, and other methods become no-ops.
+#             Default: ``True``
+#     """
+#     def __init__(self,
+#                  init_scale=2.**16,
+#                  growth_factor=2.0,
+#                  backoff_factor=0.5,
+#                  growth_interval=2000,
+#                  enabled=True):
+#         self._enabled = enabled
+#
+#         if self._enabled:
+#             assert growth_factor > 1.0, "The growth factor must be > 1.0."
+#             assert backoff_factor < 1.0, "The backoff factor must be < 1.0."
+#
+#             self._init_scale = init_scale
+#             # self._scale will be lazily initialized during the first call to scale()
+#             self._scale = None
+#             self._growth_factor = growth_factor
+#             self._backoff_factor = backoff_factor
+#             self._growth_interval = growth_interval
+#             self._init_growth_tracker = 0
+#             # self._growth_tracker will be lazily initialized during the first call to scale()
+#             self._growth_tracker = None
+#             self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
+#
+#     def _check_scale_growth_tracker(self, funcname) -> Tuple[jt.Var, jt.Var]:
+#         fix = "This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration."
+#         assert self._scale is not None, "Attempted {} but _scale is None.  ".format(funcname) + fix
+#         assert self._growth_tracker is not None, "Attempted {} but _growth_tracker is None.  ".format(funcname) + fix
+#         return (self._scale, self._growth_tracker)
+#
+#     def _lazy_init_scale_growth_tracker(self):
+#         assert self._growth_tracker is None, "_growth_tracker initialized before _scale"
+#         self._scale = self._init_scale
+#         self._growth_tracker = self._init_growth_tracker
+#
+#     def scale(self, outputs):
+#         """
+#         Multiplies ('scales') a tensor or list of tensors by the scale factor.
+#
+#         Returns scaled outputs.  If this instance of :class:`GradScaler` is not enabled, outputs are returned
+#         unmodified.
+#
+#         Args:
+#             outputs (Tensor or iterable of Tensors):  Outputs to scale.
+#         """
+#         if isinstance(outputs, dict):
+#             outputs = outputs['loss']
+#         if not self._enabled:
+#             # raise IndexError('should not in here')
+#             return outputs
+#
+#
+#         # Short-circuit for the common case.
+#         if isinstance(outputs, jt.Var):
+#             # assert jt.flags.use_cuda == 1
+#             if self._scale is None:
+#                 self._lazy_init_scale_growth_tracker()
+#             assert self._scale is not None
+#             return outputs * self._scale
+#         else:
+#             # print(outputs)
+#             raise TypeError(f'expect input be jt.Var,but got {type(outputs)}')
+#         def apply_scale(val):
+#             if isinstance(val, jt.Var):
+#                 # assert jt.flags.use_cuda == 1
+#                 if self._scale is None:
+#                     self._lazy_init_scale_growth_tracker()
+#                 assert self._scale is not None
+#                 return val * self._scale
+#             elif isinstance(val, Iterable):
+#                 iterable = map(apply_scale, val)
+#                 if isinstance(val, (list, tuple)):
+#                     return type(val)(iterable)
+#                 else:
+#                     return iterable
+#             else:
+#                 raise ValueError("outputs must be a Tensor or an iterable of Tensors")
+#
+#         return apply_scale(outputs)
+#
+#     def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16, loss):
+#         with jt.no_grad():
+#             optimizer.pre_step(loss)
+#             for group in optimizer.param_groups:
+#                 for to_unscale in group["grads"]:
+#                     if to_unscale is None or isinstance(to_unscale,(int,float)):
+#                         continue
+#                     if (not allow_fp16) and str(to_unscale.dtype) == "float16":
+#                         raise ValueError("Attempting to unscale FP16 gradients.")
+#
+#                     if not (to_unscale.isinf().any()):
+#                         if inv_scale != 1.0:
+#                             to_unscale.update(to_unscale*inv_scale)
+#                     else:
+#                         found_inf = 1.0
+#
+#         return found_inf
+#
+#     def unscale_(self, optimizer, loss):
+#         """
+#         Divides ("unscales") the optimizer's gradient tensors by the scale factor.
+#
+#         :meth:`unscale_` is optional, serving cases where you need to
+#         :ref:`modify or inspect gradients<working-with-unscaled-gradients>`
+#         between the backward pass(es) and :meth:`step`.
+#         If :meth:`unscale_` is not called explicitly,  gradients will be unscaled  automatically during :meth:`step`.
+#
+#         Simple example, using :meth:`unscale_` to enable clipping of unscaled gradients::
+#
+#             ...
+#             scaler.scale(loss).backward()
+#             scaler.unscale_(optimizer)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+#             scaler.step(optimizer)
+#             scaler.update()
+#
+#         Args:
+#             optimizer (torch.optim.Optimizer):  Optimizer that owns the gradients to be unscaled.
+#
+#         .. note::
+#             :meth:`unscale_` does not incur a CPU-GPU sync.
+#
+#         .. warning::
+#             :meth:`unscale_` should only be called once per optimizer per :meth:`step` call,
+#             and only after all gradients for that optimizer's assigned parameters have been accumulated.
+#             Calling :meth:`unscale_` twice for a given optimizer between each :meth:`step` triggers a RuntimeError.
+#
+#         .. warning::
+#             :meth:`unscale_` may unscale sparse gradients out of place, replacing the ``.grad`` attribute.
+#         """
+#         if not self._enabled:
+#             return
+#
+#         self._check_scale_growth_tracker("unscale_")
+#
+#         optimizer_state = self._per_optimizer_states[id(optimizer)]
+#
+#         if hasattr(optimizer,"get_find_inf"):
+#             return
+#         # FP32 division can be imprecise for certain compile options, so we carry out the reciprocal in FP64.
+#         assert self._scale is not None
+#         inv_scale = 1.0 / self._scale
+#         found_inf = 0.0
+#         optimizer_state["found_inf_per_device"] = self._unscale_grads_(optimizer, inv_scale, found_inf, False, loss)
+#
+#
+#     def step(self, optimizer, *args, **kwargs):
+#         """
+#         :meth:`step` carries out the following two operations:
+#
+#         1.  Internally invokes ``unscale_(optimizer)`` (unless :meth:`unscale_` was explicitly called for ``optimizer``
+#             earlier in the iteration).  As part of the :meth:`unscale_`, gradients are checked for infs/NaNs.
+#         2.  If no inf/NaN gradients are found, invokes ``optimizer.step()`` using the unscaled
+#             gradients.  Otherwise, ``optimizer.step()`` is skipped to avoid corrupting the params.
+#
+#         ``*args`` and ``**kwargs`` are forwarded to ``optimizer.step()``.
+#
+#         Returns the return value of ``optimizer.step(*args, **kwargs)``.
+#
+#         Args:
+#             optimizer (torch.optim.Optimizer):  Optimizer that applies the gradients.
+#             args:  Any arguments.
+#             kwargs:  Any keyword arguments.
+#
+#         .. warning::
+#             Closure use is not currently supported.
+#         """
+#         if (not self._enabled):
+#             return optimizer.step(*args, **kwargs)
+#
+#         if "closure" in kwargs:
+#             raise RuntimeError("Closure use is not currently supported if GradScaler is enabled.")
+#
+#         self._check_scale_growth_tracker("step")
+#
+#         optimizer_state = self._per_optimizer_states[id(optimizer)]
+#         retval = None
+#
+#         if (hasattr(optimizer, "_step_supports_amp_scaling") and optimizer._step_supports_amp_scaling):
+#             # This optimizer has customized scale-handling logic, so we can call optimizer.step() directly.
+#             # The contract with custom optimizers is that their step() should accept an additional,
+#             # optional grad_scaler kwarg.  We append self to the kwargs so the custom optimizer has full information:
+#             # it can query its own state, invoke unscale_ on itself, etc
+#             # The contract above is being deprecated to avoid introducing `grad_scaler: GradScaler` argument
+#             # to `Optimizer.step`. The new behavior is going to add two Tensor attributes of `grad_scale`
+#             # and `found_inf` to the passed optimizer so that the optimizer can utilize those
+#             # to skip the parameter updates or unscale gradients before updating parameters in
+#             # the fused kernel, e.g. `FusedAdamMathFunctor`.
+#             # In this behavior, `GradScaler._check_inf_per_device` is called if `OptState.READY`,
+#             # while the method is expected to be called by users side, i.e. their optimizers.
+#             kwargs_ = kwargs
+#             has_grad_scaler_kwarg = "grad_scaler" in inspect.signature(optimizer.step).parameters
+#             if has_grad_scaler_kwarg:
+#                 warnings.warn(
+#                     "GradScaler is going to stop passing itself as a keyword argument to the passed "
+#                     "optimizer. In the near future GradScaler registers `grad_scale: Tensor` and "
+#                     "`found_inf: Tensor` to the passed optimizer and let the optimizer use them directly.",
+#                     FutureWarning)
+#                 kwargs_.update({"grad_scaler": self})
+#             else:
+#                 if optimizer_state["stage"] is OptState.READY:
+#                     self._check_inf_per_device(optimizer)
+#                 scaler = self._get_scale_async()
+#                 found_inf = cast(
+#                     jt.Var,
+#                     sum([
+#                         t for t in optimizer_state["found_inf_per_device"].values()
+#                     ])
+#                 )
+#                 optimizer.grad_scale = None if optimizer_state["stage"] == OptState.UNSCALED else scaler
+#                 optimizer.found_inf = found_inf
+#             retval = optimizer.step(*args, **kwargs_)
+#             optimizer_state["stage"] = OptState.STEPPED
+#             if not has_grad_scaler_kwarg:
+#                 del optimizer.grad_scale
+#                 del optimizer.found_inf
+#             return retval
+#
+#         if hasattr(optimizer,"get_find_inf"):
+#             optimizer.set_grad_scale(self._scale)
+#             optimizer.step()
+#             optimizer_state["found_inf_per_device"] = optimizer.get_find_inf()
+#             return
+#
+#         retval = None
+#         if not optimizer_state["found_inf_per_device"]:
+#             retval = optimizer.step(*args, **kwargs)
+#         else:
+#             optimizer.post_step()
+#
+#         return retval
+#
+#
+#     def update(self, new_scale=None):
+#         """
+#         Updates the scale factor.
+#
+#         If any optimizer steps were skipped the scale is multiplied by ``backoff_factor``
+#         to reduce it. If ``growth_interval`` unskipped iterations occurred consecutively,
+#         the scale is multiplied by ``growth_factor`` to increase it.
+#
+#         Passing ``new_scale`` sets the new scale value manually. (``new_scale`` is not
+#         used directly, it's used to fill GradScaler's internal scale tensor. So if
+#         ``new_scale`` was a tensor, later in-place changes to that tensor will not further
+#         affect the scale GradScaler uses internally.)
+#
+#         Args:
+#             new_scale (float or :class:`torch.cuda.FloatTensor`, optional, default=None):  New scale factor.
+#
+#         .. warning::
+#             :meth:`update` should only be called at the end of the iteration, after ``scaler.step(optimizer)`` has
+#             been invoked for all optimizers used this iteration.
+#         """
+#         if not self._enabled:
+#             return
+#
+#         _scale, _growth_tracker = self._check_scale_growth_tracker("update")
+#
+#         if new_scale is not None:
+#             # Accept a new user-defined scale.
+#             if isinstance(new_scale, float):
+#                 self._scale.fill_(new_scale)  # type: ignore[union-attr]
+#             else:
+#                 reason = "new_scale should be a float or a 1-element torch.cuda.FloatTensor with requires_grad=False."
+#                 assert isinstance(new_scale, jt.float32), reason  # type: ignore[attr-defined]
+#                 assert new_scale.numel() == 1, reason
+#                 assert new_scale.requires_grad is False, reason
+#                 self._scale.copy_(new_scale)  # type: ignore[union-attr]
+#         else:
+#             # Consume shared inf/nan data collected from optimizers to update the scale.
+#             # If all found_inf tensors are on the same device as self._scale, this operation is asynchronous.
+#             found_infs = [state["found_inf_per_device"]
+#                           for state in self._per_optimizer_states.values()
+#                           ]
+#
+#             assert len(found_infs) > 0, "No inf checks were recorded prior to update."
+#
+#             found_inf_combined = found_infs[0]
+#             if len(found_infs) > 1:
+#                 for i in range(1, len(found_infs)):
+#                     found_inf_combined += found_infs[i]
+#
+#
+#             current_scale = _scale
+#             if found_inf_combined:
+#                 current_scale *=self._backoff_factor
+#                 _growth_tracker = 0
+#             else:
+#                 successful = _growth_tracker+1
+#                 if successful == self._growth_interval:
+#                     new_scale = current_scale*self._growth_factor
+#                     if new_scale < 1e9:
+#                         current_scale = new_scale
+#                     _growth_tracker = 0
+#                 else:
+#                     _growth_tracker = successful
+#
+#             self._scale, self._growth_tracker = current_scale,_growth_tracker
+#
+#         # To prepare for next iteration, clear the data collected from optimizers this iteration.
+#         self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
+#
+#     def _get_scale_async(self):
+#         return self._scale
+#
+#     def get_scale(self):
+#         """
+#         Returns a Python float containing the current scale, or 1.0 if scaling is disabled.
+#
+#         .. warning::
+#             :meth:`get_scale` incurs a CPU-GPU sync.
+#         """
+#         if self._enabled:
+#             return self._init_scale if self._scale is None else self._get_scale_async()
+#         else:
+#             return 1.0
+#
+#     def get_growth_factor(self):
+#         r"""
+#         Returns a Python float containing the scale growth factor.
+#         """
+#         return self._growth_factor
+#
+#     def set_growth_factor(self, new_factor):
+#         r"""
+#         Args:
+#             new_scale (float):  Value to use as the new scale growth factor.
+#         """
+#         self._growth_factor = new_factor
+#
+#     def get_backoff_factor(self):
+#         r"""
+#         Returns a Python float containing the scale backoff factor.
+#         """
+#         return self._backoff_factor
+#
+#     def set_backoff_factor(self, new_factor):
+#         r"""
+#         Args:
+#             new_scale (float):  Value to use as the new scale backoff factor.
+#         """
+#         self._backoff_factor = new_factor
+#
+#     def get_growth_interval(self):
+#         r"""
+#         Returns a Python int containing the growth interval.
+#         """
+#         return self._growth_interval
+#
+#     def set_growth_interval(self, new_interval):
+#         r"""
+#         Args:
+#             new_interval (int):  Value to use as the new growth interval.
+#         """
+#         self._growth_interval = new_interval
+#
+#     def _get_growth_tracker(self):
+#         if self._enabled:
+#             return self._init_growth_tracker if self._growth_tracker is None else self._growth_tracker.item()
+#         else:
+#             return 0
+#
+#     def is_enabled(self):
+#         r"""
+#         Returns a bool indicating whether this instance is enabled.
+#         """
+#         return self._enabled
+#
+#     def state_dict(self):
+#         r"""
+#         Returns the state of the scaler as a :class:`dict`.  It contains five entries:
+#
+#         * ``"scale"`` - a Python float containing the current scale
+#         * ``"growth_factor"`` - a Python float containing the current growth factor
+#         * ``"backoff_factor"`` - a Python float containing the current backoff factor
+#         * ``"growth_interval"`` - a Python int containing the current growth interval
+#         * ``"_growth_tracker"`` - a Python int containing the number of recent consecutive unskipped steps.
+#
+#         If this instance is not enabled, returns an empty dict.
+#
+#         .. note::
+#            If you wish to checkpoint the scaler's state after a particular iteration, :meth:`state_dict`
+#            should be called after :meth:`update`.
+#         """
+#         return {"scale": self.get_scale(),
+#                 "growth_factor": self._growth_factor,
+#                 "backoff_factor": self._backoff_factor,
+#                 "growth_interval": self._growth_interval,
+#                 "_growth_tracker": self._get_growth_tracker()} if self._enabled else {}
+#
+#     def load_state_dict(self, state_dict):
+#         r"""
+#         Loads the scaler state.  If this instance is disabled, :meth:`load_state_dict` is a no-op.
+#
+#         Args:
+#            state_dict(dict): scaler state.  Should be an object returned from a call to :meth:`state_dict`.
+#         """
+#         if not self._enabled:
+#             return
+#
+#         if len(state_dict) == 0:
+#             raise RuntimeError("The source state dict is empty, possibly because it was saved "
+#                                "from a disabled instance of GradScaler.")
+#
+#         self._init_scale = state_dict["scale"]
+#         if self._scale is not None:
+#             self._scale.fill_(state_dict["scale"])
+#         self._growth_factor = state_dict["growth_factor"]
+#         self._backoff_factor = state_dict["backoff_factor"]
+#         self._growth_interval = state_dict["growth_interval"]
+#         self._init_growth_tracker = state_dict["_growth_tracker"]
+#         if self._growth_tracker is not None:
+#             self._growth_tracker.fill_(state_dict["_growth_tracker"])
+#
+#     def __getstate__(self):
+#         state = self.__dict__.copy()
+#         if self._enabled:
+#             assert len(self._per_optimizer_states) == 0, "A GradScaler instance may only be pickled at the beginning "                                                         "of an iteration, or at the end after scaler.update()."
+#             # Pickling _scale and _growth_tracker Tensors directly triggers
+#             # "warnings.warn("pickle support for Storage will be removed in 1.5..."
+#             # so instead, we set the unpickled instance up to reinitialize them lazily.
+#             state['_init_scale'] = self.get_scale()
+#             state['_init_growth_tracker'] = self._get_growth_tracker()
+#             state['_scale'] = None
+#             state['_growth_tracker'] = None
+#         return state
+#
+#     def __setstate__(self, state):
+#         self.__dict__.update(state)
+#
+#     def _check_inf_per_device(self, optimizer):
+#         _scale, _ = self._check_scale_growth_tracker("_check_inf_per_device")
+#
+#         dummy_inv_scale = 1.0
+#         found_inf = 0.0
+#
+#         self._per_optimizer_states[id(optimizer)]["found_inf_per_device"] =             self._unscale_grads_(optimizer, dummy_inv_scale, found_inf, True)
+#
+#         return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
+#
+#     def _found_inf_per_device(self, optimizer):
+#         return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
 class GradScaler:
-    
-    _scale: Optional[jt.Var]
-    _grows_tracker: Optional[jt.Var]
-    _per_optimizer_states: Dict[int, Dict[str, Any]]
-    """
-    An instance ``scaler`` of :class:`GradScaler` helps perform the steps of gradient scaling
-    conveniently.
-
-    * ``scaler.scale(loss)`` multiplies a given loss by ``scaler``'s current scale factor.
-    * ``scaler.step(optimizer)`` safely unscales gradients and calls ``optimizer.step()``.
-    * ``scaler.update()`` updates ``scaler``'s scale factor.
-
-    Example::
-
-        # Creates a GradScaler once at the beginning of training.
-        scaler = GradScaler()
-
-        for epoch in epochs:
-            for input, target in data:
-                optimizer.zero_grad()
-                output = model(input)
-                loss = loss_fn(output, target)
-
-                # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
-                scaler.scale(loss).backward()
-
-                # scaler.step() first unscales gradients of the optimizer's params.
-                # If gradients don't contain infs/NaNs, optimizer.step() is then called,
-                # otherwise, optimizer.step() is skipped.
-                scaler.step(optimizer)
-
-                # Updates the scale for next iteration.
-                scaler.update()
-
-    See the :ref:`Automatic Mixed Precision examples<amp-examples>` for usage
-    (along with autocasting) in more complex cases like gradient clipping, gradient accumulation, gradient penalty,
-    and multiple losses/optimizers.
-
-    ``scaler`` dynamically estimates the scale factor each iteration.  To minimize gradient underflow,
-    a large scale factor should be used.  However, ``float16`` values can "overflow" (become inf or NaN) if
-    the scale factor is too large.  Therefore, the optimal scale factor is the largest factor that can be used
-    without incurring inf or NaN gradient values.
-    ``scaler`` approximates the optimal scale factor over time by checking the gradients for infs and NaNs during every
-    ``scaler.step(optimizer)`` (or optional separate ``scaler.unscale_(optimizer)``, see :meth:`unscale_`).
-
-    * If infs/NaNs are found, ``scaler.step(optimizer)`` skips the underlying ``optimizer.step()`` (so the params
-      themselves remain uncorrupted) and ``update()`` multiplies the scale by ``backoff_factor``.
-
-    * If no infs/NaNs are found, ``scaler.step(optimizer)`` runs the underlying ``optimizer.step()`` as usual.
-      If ``growth_interval`` unskipped iterations occur consecutively, ``update()`` multiplies the scale by
-      ``growth_factor``.
-
-    The scale factor often causes infs/NaNs to appear in gradients for the first few iterations as its
-    value calibrates.  ``scaler.step`` will skip the underlying ``optimizer.step()`` for these
-    iterations.  After that, step skipping should occur rarely (once every few hundred or thousand iterations).
-
-    Args:
-        init_scale (float, optional, default=2.**16):  Initial scale factor.
-        growth_factor (float, optional, default=2.0):  Factor by which the scale is multiplied during
-            :meth:`update` if no inf/NaN gradients occur for ``growth_interval`` consecutive iterations.
-        backoff_factor (float, optional, default=0.5):  Factor by which the scale is multiplied during
-            :meth:`update` if inf/NaN gradients occur in an iteration.
-        growth_interval (int, optional, default=2000):  Number of consecutive iterations without inf/NaN gradients
-            that must occur for the scale to be multiplied by ``growth_factor``.
-        enabled (bool, optional):  If ``False``, disables gradient scaling. :meth:`step` simply
-            invokes the underlying ``optimizer.step()``, and other methods become no-ops.
-            Default: ``True``
-    """
-    def __init__(self,
-                 init_scale=2.**16,
-                 growth_factor=2.0,
-                 backoff_factor=0.5,
-                 growth_interval=2000,
-                 enabled=True):
-        self._enabled = enabled
-
-        if self._enabled:
-            assert growth_factor > 1.0, "The growth factor must be > 1.0."
-            assert backoff_factor < 1.0, "The backoff factor must be < 1.0."
-
-            self._init_scale = init_scale
-            # self._scale will be lazily initialized during the first call to scale()
-            self._scale = None
-            self._growth_factor = growth_factor
-            self._backoff_factor = backoff_factor
-            self._growth_interval = growth_interval
-            self._init_growth_tracker = 0
-            # self._growth_tracker will be lazily initialized during the first call to scale()
-            self._growth_tracker = None
-            self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
-
-    def _check_scale_growth_tracker(self, funcname) -> Tuple[jt.Var, jt.Var]:
-        fix = "This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration."
-        assert self._scale is not None, "Attempted {} but _scale is None.  ".format(funcname) + fix
-        assert self._growth_tracker is not None, "Attempted {} but _growth_tracker is None.  ".format(funcname) + fix
-        return (self._scale, self._growth_tracker)
-
-    def _lazy_init_scale_growth_tracker(self):
-        assert self._growth_tracker is None, "_growth_tracker initialized before _scale"
-        self._scale = self._init_scale
-        self._growth_tracker = self._init_growth_tracker
-
-    def scale(self, outputs):
-        """
-        Multiplies ('scales') a tensor or list of tensors by the scale factor.
-
-        Returns scaled outputs.  If this instance of :class:`GradScaler` is not enabled, outputs are returned
-        unmodified.
-
-        Args:
-            outputs (Tensor or iterable of Tensors):  Outputs to scale.
-        """
-        if isinstance(outputs, dict):
-            outputs = outputs['loss']
-        if not self._enabled:
-            # raise IndexError('should not in here')
-            return outputs
-        
-
-        # Short-circuit for the common case.
-        if isinstance(outputs, jt.Var):
-            # assert jt.flags.use_cuda == 1
-            if self._scale is None:
-                self._lazy_init_scale_growth_tracker()
-            assert self._scale is not None
-            return outputs * self._scale
+    def __init__(
+            self,
+            init_scale: float = None,
+            dtype :jt.dtype= jt.float32,
+            growth_factor: float = 2.0,
+            backoff_factor: float = 0.5,
+            growth_interval :int = 2000,
+            min_scale: float = None
+    ):
+        self.dtype = dtype
+        self.finfo = jt.finfo(dtype)
+        if init_scale is None:
+            self.init_scale = self.finfo.max * 0.5
         else:
-            print(outputs)
-            raise TypeError(f'expect input be jt.Var,but got {type(outputs)}')
-        def apply_scale(val):
-            if isinstance(val, jt.Var):
-                # assert jt.flags.use_cuda == 1
-                if self._scale is None:
-                    self._lazy_init_scale_growth_tracker()
-                assert self._scale is not None
-                return val * self._scale
-            elif isinstance(val, Iterable):
-                iterable = map(apply_scale, val)
-                if isinstance(val, (list, tuple)):
-                    return type(val)(iterable)
-                else:
-                    return iterable
-            else:
-                raise ValueError("outputs must be a Tensor or an iterable of Tensors")
-
-        return apply_scale(outputs)
-
-    def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16, loss):
-        with jt.no_grad():
-            optimizer.pre_step(loss)
-            for group in optimizer.param_groups:
-                for to_unscale in group["grads"]:
-                    if to_unscale is None or isinstance(to_unscale,(int,float)):
-                        continue
-                    if (not allow_fp16) and str(to_unscale.dtype) == "float16":
-                        raise ValueError("Attempting to unscale FP16 gradients.")
-                    
-                    if not (to_unscale.isinf().any()):
-                        if inv_scale != 1.0:
-                            to_unscale.update(to_unscale*inv_scale) 
-                    else:
-                        found_inf = 1.0
-
-        return found_inf
-
-    def unscale_(self, optimizer, loss):
-        """
-        Divides ("unscales") the optimizer's gradient tensors by the scale factor.
-
-        :meth:`unscale_` is optional, serving cases where you need to
-        :ref:`modify or inspect gradients<working-with-unscaled-gradients>`
-        between the backward pass(es) and :meth:`step`.
-        If :meth:`unscale_` is not called explicitly,  gradients will be unscaled  automatically during :meth:`step`.
-
-        Simple example, using :meth:`unscale_` to enable clipping of unscaled gradients::
-
-            ...
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            scaler.step(optimizer)
-            scaler.update()
-
-        Args:
-            optimizer (torch.optim.Optimizer):  Optimizer that owns the gradients to be unscaled.
-
-        .. note::
-            :meth:`unscale_` does not incur a CPU-GPU sync.
-
-        .. warning::
-            :meth:`unscale_` should only be called once per optimizer per :meth:`step` call,
-            and only after all gradients for that optimizer's assigned parameters have been accumulated.
-            Calling :meth:`unscale_` twice for a given optimizer between each :meth:`step` triggers a RuntimeError.
-
-        .. warning::
-            :meth:`unscale_` may unscale sparse gradients out of place, replacing the ``.grad`` attribute.
-        """
-        if not self._enabled:
-            return
-
-        self._check_scale_growth_tracker("unscale_")
-
-        optimizer_state = self._per_optimizer_states[id(optimizer)]
-        
-        if hasattr(optimizer,"get_find_inf"):
-            return
-        # FP32 division can be imprecise for certain compile options, so we carry out the reciprocal in FP64.
-        assert self._scale is not None
-        inv_scale = 1.0 / self._scale
-        found_inf = 0.0
-        optimizer_state["found_inf_per_device"] = self._unscale_grads_(optimizer, inv_scale, found_inf, False, loss)
-
-
-    def step(self, optimizer, *args, **kwargs):
-        """
-        :meth:`step` carries out the following two operations:
-
-        1.  Internally invokes ``unscale_(optimizer)`` (unless :meth:`unscale_` was explicitly called for ``optimizer``
-            earlier in the iteration).  As part of the :meth:`unscale_`, gradients are checked for infs/NaNs.
-        2.  If no inf/NaN gradients are found, invokes ``optimizer.step()`` using the unscaled
-            gradients.  Otherwise, ``optimizer.step()`` is skipped to avoid corrupting the params.
-
-        ``*args`` and ``**kwargs`` are forwarded to ``optimizer.step()``.
-
-        Returns the return value of ``optimizer.step(*args, **kwargs)``.
-
-        Args:
-            optimizer (torch.optim.Optimizer):  Optimizer that applies the gradients.
-            args:  Any arguments.
-            kwargs:  Any keyword arguments.
-
-        .. warning::
-            Closure use is not currently supported.
-        """
-        if (not self._enabled):
-            return optimizer.step(*args, **kwargs)
-
-        if "closure" in kwargs:
-            raise RuntimeError("Closure use is not currently supported if GradScaler is enabled.")
-
-        self._check_scale_growth_tracker("step")
-
-        optimizer_state = self._per_optimizer_states[id(optimizer)]
-        retval = None
-
-        if (hasattr(optimizer, "_step_supports_amp_scaling") and optimizer._step_supports_amp_scaling):
-            # This optimizer has customized scale-handling logic, so we can call optimizer.step() directly.
-            # The contract with custom optimizers is that their step() should accept an additional,
-            # optional grad_scaler kwarg.  We append self to the kwargs so the custom optimizer has full information:
-            # it can query its own state, invoke unscale_ on itself, etc
-            # The contract above is being deprecated to avoid introducing `grad_scaler: GradScaler` argument
-            # to `Optimizer.step`. The new behavior is going to add two Tensor attributes of `grad_scale`
-            # and `found_inf` to the passed optimizer so that the optimizer can utilize those
-            # to skip the parameter updates or unscale gradients before updating parameters in
-            # the fused kernel, e.g. `FusedAdamMathFunctor`.
-            # In this behavior, `GradScaler._check_inf_per_device` is called if `OptState.READY`,
-            # while the method is expected to be called by users side, i.e. their optimizers.
-            kwargs_ = kwargs
-            has_grad_scaler_kwarg = "grad_scaler" in inspect.signature(optimizer.step).parameters
-            if has_grad_scaler_kwarg:
-                warnings.warn(
-                    "GradScaler is going to stop passing itself as a keyword argument to the passed "
-                    "optimizer. In the near future GradScaler registers `grad_scale: Tensor` and "
-                    "`found_inf: Tensor` to the passed optimizer and let the optimizer use them directly.",
-                    FutureWarning)
-                kwargs_.update({"grad_scaler": self})
-            else:
-                if optimizer_state["stage"] is OptState.READY:
-                    self._check_inf_per_device(optimizer)
-                scaler = self._get_scale_async()
-                found_inf = cast(
-                    jt.Var,
-                    sum([
-                        t for t in optimizer_state["found_inf_per_device"].values()
-                    ])
-                )
-                optimizer.grad_scale = None if optimizer_state["stage"] == OptState.UNSCALED else scaler
-                optimizer.found_inf = found_inf
-            retval = optimizer.step(*args, **kwargs_)
-            optimizer_state["stage"] = OptState.STEPPED
-            if not has_grad_scaler_kwarg:
-                del optimizer.grad_scale
-                del optimizer.found_inf
-            return retval
-
-        if hasattr(optimizer,"get_find_inf"):
-            optimizer.set_grad_scale(self._scale)
-            optimizer.step()
-            optimizer_state["found_inf_per_device"] = optimizer.get_find_inf()
-            return
-        
-        retval = None
-        if not optimizer_state["found_inf_per_device"]:
-            retval = optimizer.step(*args, **kwargs)
+            self.init_scale = init_scale if init_scale < self.finfo.max else self.finfo.max * 0.5
+        if min_scale is None:
+            self.min_scale = self.finfo.min * 100
         else:
-            optimizer.post_step()
+            self.min_scale = min_scale if min_scale > self.finfo.min else self.finfo.min * 100
+        self.growth_factor = growth_factor
+        self.backoff_factor = backoff_factor
+        self.growth_interval = growth_interval
+        self.scale_factor = jt.array(self.init_scale, dtype = dtype)
+        self.unskipped_step = 0
+        self.overflow = False
+        self.grad = False
 
-        return retval
+    def scale(self, loss):
+        return loss * self.scale_factor
+
+    def unscale_(self,loss):
+        '''from theory we can directly divide the loss by scale factor to realize unscale'''
+        return loss / self.scale_factor
+        # if not self.grad:
+        #     print('before pre_step in unscale')
+        #     # loss = loss.to(jt.float32)
+        #     # print(f'type of loss:{loss.dtype}')
+        #     optimizer.step()
+        #     # optimizer.pre_step(loss = loss)
+        #     print('after pre_step in unscale')
+        #     self.grad = True
+        # for param_groups in optimizer.param_groups:
+        #     for param in param_groups['params']:
+        #         print('before get grad in unscale')
+        #         a = param.opt_grad(optimizer).copy()
+        #         if param.opt_grad is not None:
+        #             print('before assign in unscale')
+        #             param.opt_grad(optimizer).update(a / self.scale_factor)
+
     
 
-    def update(self, new_scale=None):
-        """
-        Updates the scale factor.
-
-        If any optimizer steps were skipped the scale is multiplied by ``backoff_factor``
-        to reduce it. If ``growth_interval`` unskipped iterations occurred consecutively,
-        the scale is multiplied by ``growth_factor`` to increase it.
-
-        Passing ``new_scale`` sets the new scale value manually. (``new_scale`` is not
-        used directly, it's used to fill GradScaler's internal scale tensor. So if
-        ``new_scale`` was a tensor, later in-place changes to that tensor will not further
-        affect the scale GradScaler uses internally.)
-
-        Args:
-            new_scale (float or :class:`torch.cuda.FloatTensor`, optional, default=None):  New scale factor.
-
-        .. warning::
-            :meth:`update` should only be called at the end of the iteration, after ``scaler.step(optimizer)`` has
-            been invoked for all optimizers used this iteration.
-        """
-        if not self._enabled:
-            return
-
-        _scale, _growth_tracker = self._check_scale_growth_tracker("update")
-
-        if new_scale is not None:
-            # Accept a new user-defined scale.
-            if isinstance(new_scale, float):
-                self._scale.fill_(new_scale)  # type: ignore[union-attr]
-            else:
-                reason = "new_scale should be a float or a 1-element torch.cuda.FloatTensor with requires_grad=False."
-                assert isinstance(new_scale, jt.float32), reason  # type: ignore[attr-defined]
-                assert new_scale.numel() == 1, reason
-                assert new_scale.requires_grad is False, reason
-                self._scale.copy_(new_scale)  # type: ignore[union-attr]
+    def update(self):
+        self.grad = False
+        if self.overflow:
+            self.scale_factor *= self.backoff_factor
+            self.unskipped_step = 0
         else:
-            # Consume shared inf/nan data collected from optimizers to update the scale.
-            # If all found_inf tensors are on the same device as self._scale, this operation is asynchronous.
-            found_infs = [state["found_inf_per_device"]
-                          for state in self._per_optimizer_states.values()
-                          ]
-
-            assert len(found_infs) > 0, "No inf checks were recorded prior to update."
-
-            found_inf_combined = found_infs[0]
-            if len(found_infs) > 1:
-                for i in range(1, len(found_infs)):
-                    found_inf_combined += found_infs[i]
-
-
-            current_scale = _scale
-            if found_inf_combined:
-                current_scale *=self._backoff_factor
-                _growth_tracker = 0
-            else:
-                successful = _growth_tracker+1
-                if successful == self._growth_interval:
-                    new_scale = current_scale*self._growth_factor
-                    if new_scale < 1e9:
-                        current_scale = new_scale
-                    _growth_tracker = 0
-                else:
-                    _growth_tracker = successful
-
-            self._scale, self._growth_tracker = current_scale,_growth_tracker
-
-        # To prepare for next iteration, clear the data collected from optimizers this iteration.
-        self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
-
-    def _get_scale_async(self):
-        return self._scale
-
-    def get_scale(self):
-        """
-        Returns a Python float containing the current scale, or 1.0 if scaling is disabled.
-
-        .. warning::
-            :meth:`get_scale` incurs a CPU-GPU sync.
-        """
-        if self._enabled:
-            return self._init_scale if self._scale is None else self._get_scale_async()
-        else:
-            return 1.0
-
-    def get_growth_factor(self):
-        r"""
-        Returns a Python float containing the scale growth factor.
-        """
-        return self._growth_factor
-
-    def set_growth_factor(self, new_factor):
-        r"""
-        Args:
-            new_scale (float):  Value to use as the new scale growth factor.
-        """
-        self._growth_factor = new_factor
-
-    def get_backoff_factor(self):
-        r"""
-        Returns a Python float containing the scale backoff factor.
-        """
-        return self._backoff_factor
-
-    def set_backoff_factor(self, new_factor):
-        r"""
-        Args:
-            new_scale (float):  Value to use as the new scale backoff factor.
-        """
-        self._backoff_factor = new_factor
-
-    def get_growth_interval(self):
-        r"""
-        Returns a Python int containing the growth interval.
-        """
-        return self._growth_interval
-
-    def set_growth_interval(self, new_interval):
-        r"""
-        Args:
-            new_interval (int):  Value to use as the new growth interval.
-        """
-        self._growth_interval = new_interval
-
-    def _get_growth_tracker(self):
-        if self._enabled:
-            return self._init_growth_tracker if self._growth_tracker is None else self._growth_tracker.item()
-        else:
-            return 0
-
-    def is_enabled(self):
-        r"""
-        Returns a bool indicating whether this instance is enabled.
-        """
-        return self._enabled
+            self.unskipped_step += 1
+            if self.unskipped_step >= self.growth_interval:
+                self.scale_factor *= self.growth_factor
+                self.unskipped_step = 0
+            self.scale_factor = jt.clamp(self.scale_factor, self.min_scale)
 
     def state_dict(self):
-        r"""
-        Returns the state of the scaler as a :class:`dict`.  It contains five entries:
+        return{
+            'dtype':self.dtype,
+            'scale_factor':self.scale_factor.item(),
+            'unskipped_step':self.unskipped_step,
+            'overflow':self.overflow
+        }
 
-        * ``"scale"`` - a Python float containing the current scale
-        * ``"growth_factor"`` - a Python float containing the current growth factor
-        * ``"backoff_factor"`` - a Python float containing the current backoff factor
-        * ``"growth_interval"`` - a Python int containing the current growth interval
-        * ``"_growth_tracker"`` - a Python int containing the number of recent consecutive unskipped steps.
+    def load(self, state_dict:Dict):
+        self.dtype = state_dict['dtype']
+        self.unskipped_step = state_dict['unskipped_factor']
+        self.scale_factor = jt.array(state_dict['scale_factor'], dtype =self.dtype)
+        self.overflow = state_dict['overflow']
+    def step(self,optimizer,loss):
+        # if not self.grad:
+        #     # print(f'before pre_step')
+        #     optimizer.pre_step(loss)
+        #     self.grad = True
+        # print('before backward')
+        # optimizer.zero_grad()
+        optimizer.backward(loss)
+        # print('after backward')
+        grad_norm = jt.array(0.)
+        # print(f'before assign loop')
+        with jt.no_grad():
+            self.overflow = False
+            for param_groups in optimizer.param_groups:
+                # v = param_groups['params']
+                # print(f'param_groups:{param_groups}')
+                # raise RuntimeError('TODO:need to check why this could not run')
+                for param in param_groups['params']:
+                    # print(f'try copy')
+                    # notice: must copy here
+                    # print(f'before get grad')
+                    aa = param.opt_grad(optimizer).copy()
+                    # print(f'after get grad')
 
-        If this instance is not enabled, returns an empty dict.
+                    is_inf = jt.isinf(aa)
+                    # print(f'after inf check')
+                    is_nan = jt.isnan(aa)
+                    # print(f'after nan check')
+                    is_inf = is_inf.sum().data
+                    is_nan = is_nan.sum().data
+                    # print('after sum')
+                    # is_inf = is_inf.to('cpu').data()
+                    # is_nan = is_nan.to('cpu').data()
+                    # print('after convert')
+                    # print(f'is_inf:{is_inf} \n is nan:{is_nan}')
+                    if is_inf or is_nan:
+                    # if .any() or jt.isnan(aa).any():
+                        self.overflow = True
+                    # print(f'after check')
+                    # print(f'copy done')
+                    # m = param.name
+                    
+                    # print(f'before get a {m}',end=' ')
+                    # print(f'param:{param.numpy()}')
+                    # if grad_norm.shape != aa.shape:
+                    #     grad_norm.reshape(aa.shape)
+                    # if grad_norm.shape != param.opt_grad(optimizer).shape:
+                    #     grad_norm.reshape(param.opt_grad(optimizer).shape)
+                    # a = jt.array(param.opt_grad(optimizer), dtype= jt.float32)
+                    # print(f'param:{m},grad:{a.numpy()}')
+                    grad_norm += (aa ** 2).sum().reshape(-1)
+            grad_norm = jt.sqrt(grad_norm.sum())
+            # print('before print')
+            # print(f'grad_norm:{grad_norm.data}', end = ' ')
+        # self.check_overflow(optimizer)
+        if self.overflow:
+            optimizer.step()
+        else:
+            # print('before step')
+            optimizer.step(loss)
+        optimizer.zero_grad()
+            # print('after step')
+    # def check_overflow(self, optimizer):
+    #     self.overflow = False
+    #     # print(f'before check overflow loop')
+    #     with jt.no_grad():
+    #         for param_groups in optimizer.param_groups:
+    #             for param in param_groups['params']:
+    #                 a = param.opt_grad(optimizer).copy()
+    #                 if a is None:
+    #                     continue
+    #                 if jt.isinf(a).any() or jt.isnan(a).any():
+    #                     self.overflow = True
+    #                     return self.overflow
+    #     return self.overflow
 
-        .. note::
-           If you wish to checkpoint the scaler's state after a particular iteration, :meth:`state_dict`
-           should be called after :meth:`update`.
-        """
-        return {"scale": self.get_scale(),
-                "growth_factor": self._growth_factor,
-                "backoff_factor": self._backoff_factor,
-                "growth_interval": self._growth_interval,
-                "_growth_tracker": self._get_growth_tracker()} if self._enabled else {}
-
-    def load_state_dict(self, state_dict):
-        r"""
-        Loads the scaler state.  If this instance is disabled, :meth:`load_state_dict` is a no-op.
-
-        Args:
-           state_dict(dict): scaler state.  Should be an object returned from a call to :meth:`state_dict`.
-        """
-        if not self._enabled:
-            return
-
-        if len(state_dict) == 0:
-            raise RuntimeError("The source state dict is empty, possibly because it was saved "
-                               "from a disabled instance of GradScaler.")
-
-        self._init_scale = state_dict["scale"]
-        if self._scale is not None:
-            self._scale.fill_(state_dict["scale"])
-        self._growth_factor = state_dict["growth_factor"]
-        self._backoff_factor = state_dict["backoff_factor"]
-        self._growth_interval = state_dict["growth_interval"]
-        self._init_growth_tracker = state_dict["_growth_tracker"]
-        if self._growth_tracker is not None:
-            self._growth_tracker.fill_(state_dict["_growth_tracker"])
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if self._enabled:
-            assert len(self._per_optimizer_states) == 0, "A GradScaler instance may only be pickled at the beginning "                                                         "of an iteration, or at the end after scaler.update()."
-            # Pickling _scale and _growth_tracker Tensors directly triggers
-            # "warnings.warn("pickle support for Storage will be removed in 1.5..."
-            # so instead, we set the unpickled instance up to reinitialize them lazily.
-            state['_init_scale'] = self.get_scale()
-            state['_init_growth_tracker'] = self._get_growth_tracker()
-            state['_scale'] = None
-            state['_growth_tracker'] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-
-    def _check_inf_per_device(self, optimizer):
-        _scale, _ = self._check_scale_growth_tracker("_check_inf_per_device")
-
-        dummy_inv_scale = 1.0
-        found_inf = 0.0
-
-        self._per_optimizer_states[id(optimizer)]["found_inf_per_device"] =             self._unscale_grads_(optimizer, dummy_inv_scale, found_inf, True)
-
-        return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
-
-    def _found_inf_per_device(self, optimizer):
-        return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
-# class GradScaler:
-#     def __init__(
-#             self,
-#             init_scale: float = None,
-#             dtype :jt.dtype= jt.float32,
-#             growth_factor: float = 2.0,
-#             backoff_factor: float = 0.5,
-#             growth_interval :int = 2000,
-#             min_scale: float = None
-#     ):
-#         self.dtype = dtype
-#         self.finfo = jt.finfo(dtype)
-#         if init_scale is None:
-#             self.init_scale = self.finfo.max * 0.5
-#         else:
-#             self.init_scale = init_scale if init_scale < self.finfo.max else self.finfo.max * 0.5
-#         if min_scale is None:
-#             self.min_scale = self.finfo.min * 100
-#         else:
-#             self.min_scale = min_scale if min_scale > self.finfo.min else self.finfo.min * 100
-#         self.growth_factor = growth_factor
-#         self.backoff_factor = backoff_factor
-#         self.growth_interval = growth_interval
-#         self.scale_factor = jt.array(self.init_scale, dtype = dtype)
-#         self.unskipped_step = 0
-#         self.overflow = False
-
-#     def scale(self, tensor):
-#         return tensor * self.scale_factor
-
-#     def unscale(self, tensor):
-#         for param_groups in optimizer.param_groups:
-#             for param in param_groups['params']:
-#                 if param.grad is not None:
-#                     param.grad = param.grad / self.scale_factor
-
-#     def check_overflow(self, optimizer):
-#         self.overflow = False
-#         for param_groups in optimizer.param_groups:
-#             for param in param_groups['params']:
-#                 if param.grad is None:
-#                     continue
-#                 if jt.isinf(param.grad).any() or jt.isnan(param.grad).any():
-#                     self.overflow = True
-#                     return self.overflow
-#         return self.overflow
-
-#     def update(self):
-#         if self.overflow:
-#             self.scale_factor *= self.backoff_factor
-#             self.unskipped_step = 0
-#         else:
-#             self.unskipped_step += 1
-#             if self.unskipped_step >= growth_interval:
-#                 self.scale_factor *= self.growth_factor
-#                 self.unskipped_step = 0
-#             self.scale_factor = jt.clamp(self.scale_factor, self.min_scale)
-
-#     def state_dict(self):
-#         return{
-#             'dtype':self.dtype,
-#             'scale_factor':self.scale_factor.item(),
-#             'unskipped_step':self.unskipped_step,
-#             'overflow':self.overflow
-#         }
-
-#     def load(self, state_dict:Dict):
-#         self.dtype = state_dict['dtype']
-#         self.unskipped_step = state_dict['unskipped_factor']
-#         self.scale_factor = jt.array(state_dict['scale_factor'], dtype =self.dtype)
-#         self.overflow = state_dict['overflow']
 #     def step(
 #         self, optimizer: jt.optim.Optimizer, *args: Any, **kwargs: Any
 #     ) -> Optional[float]:
@@ -12874,25 +13035,33 @@ class AmpOptimWrapper:
             loss (jt.Var): The loss of current iteration.
             kwargs: Keyword arguments passed to :meth:`jt.Var.backward`
         """
-        self.loss_scaler.scale(loss).backward(**kwargs)
+        loss = self.loss_scaler.scale(loss)
+        self.loss_scaler.step(self.optimizer, loss = loss,**kwargs)
         self._inner_count += 1
 
-    def step(self, **kwargs):
+    def step(self, loss):
         """Update parameters with :attr:`loss_scaler`.
 
         Args:
             kwargs: Keyword arguments passed to
                 :meth:`jt.optim.Optimizer.step`.
         """
-        if self._inner_count == 0:
-#             assert isinstance(kwargs,jt.Var),f'kwargs:{kwargs}'
-            self.loss_scaler.scale(outputs = kwargs)
-        if self.clip_grad_kwargs:
+#         if self._inner_count == 0:
+# #             assert isinstance(kwargs,jt.Var),f'kwargs:{kwargs}'
 #             self.loss_scaler.scale(outputs = kwargs)
-            self.loss_scaler.unscale_(self.optimizer,**kwargs)
+        
+#             self.loss_scaler.scale(outputs = kwargs)
+            # print(f'before unscale_')
+        if self.clip_grad_kwargs:
+            loss = self.loss_scaler.unscale_(loss)
+            # print(f'before clip')
+        # print(f'before step')
+        self.loss_scaler.step(self.optimizer, loss)
+        # print(f'before updata')
+        self.loss_scaler.update()
+        if self.clip_grad_kwargs:
             self._clip_grad()
-        self.loss_scaler.step(self.optimizer, **kwargs)
-        self.loss_scaler.update(self._scale_update_param)
+        # print(f'done')
 
     def _clip_grad(self) -> None:
         """Clip the gradients of parameters."""
@@ -12905,9 +13074,9 @@ class AmpOptimWrapper:
         if len(params) > 0:
             grad = self.clip_func(**self.clip_grad_kwargs)
             # `torch.nn.utils.clip_grad_value_` will return None.
-            if grad is not None:
-                print(f'train/{self.grad_name}',
-                                               float(grad))
+            # if grad is not None:
+            #     print(f'train/{self.grad_name}',
+            #                                    float(grad))
 
     def state_dict(self) -> dict:
         """Get the state dictionary of :attr:`optimizer` and
@@ -13034,7 +13203,43 @@ def bbox_overlaps(bboxes1,
 
 
 # In[ ]:
+class Params:
+    '''
+    Params for coco evaluation api
+    '''
+    def setDetParams(self):
+        self.imgIds = []
+        self.catIds = []
+        # np.arange causes trouble.  the data point on arange is slightly larger than the true value
+        self.iouThrs = np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
+        self.recThrs = np.linspace(.0, 1.00, int(np.round((1.00 - .0) / .01)) + 1, endpoint=True)
+        self.maxDets = [1, 10, 100]
+        self.areaRng = [[0 ** 2, 1e5 ** 2], [0 ** 2, 32 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e5 ** 2]]
+        self.areaRngLbl = ['all', 'small', 'medium', 'large']
+        self.useCats = 1
 
+    def setKpParams(self):
+        self.imgIds = []
+        self.catIds = []
+        # np.arange causes trouble.  the data point on arange is slightly larger than the true value
+        self.iouThrs = np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
+        self.recThrs = np.linspace(.0, 1.00, int(np.round((1.00 - .0) / .01)) + 1, endpoint=True)
+        self.maxDets = [20]
+        self.areaRng = [[0 ** 2, 1e5 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e5 ** 2]]
+        self.areaRngLbl = ['all', 'medium', 'large']
+        self.useCats = 1
+        self.kpt_oks_sigmas = np.array([.26, .25, .25, .35, .35, .79, .79, .72, .72, .62,.62, 1.07, 1.07, .87, .87, .89, .89])/10.0
+
+    def __init__(self, iouType='segm'):
+        if iouType == 'segm' or iouType == 'bbox':
+            self.setDetParams()
+        elif iouType == 'keypoints':
+            self.setKpParams()
+        else:
+            raise Exception('iouType not supported')
+        self.iouType = iouType
+        # useSegm is deprecated
+        self.useSegm = None
 
 
 
@@ -13112,8 +13317,8 @@ class COCOeval:
         self.stats = []                     # result summarization
         self.ious = {}                      # ious between all gts and dts
         if not cocoGt is None:
-            self.params.img_ids = sorted(cocoGt.getImg_ids())
-            self.params.cat_ids = sorted(cocoGt.getCat_ids())
+            self.params.img_ids = sorted(cocoGt.get_img_ids())
+            self.params.cat_ids = sorted(cocoGt.get_cat_ids())
 
 
     def _prepare(self):
@@ -13412,8 +13617,8 @@ class COCOeval:
                     tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
                     fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
 
-                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
-                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float64)
+                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float64)
                     for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
                         tp = np.array(tp)
                         fp = np.array(fp)
@@ -13540,7 +13745,25 @@ class COCOeval:
 
 # In[78]:
 
+def set_recall_param(proposal_nums, iou_thrs):
+    """Check proposal_nums and iou_thrs and set correct format."""
+    if isinstance(proposal_nums, Sequence):
+        _proposal_nums = np.array(proposal_nums)
+    elif isinstance(proposal_nums, int):
+        _proposal_nums = np.array([proposal_nums])
+    else:
+        _proposal_nums = proposal_nums
 
+    if iou_thrs is None:
+        _iou_thrs = np.array([0.5])
+    elif isinstance(iou_thrs, Sequence):
+        _iou_thrs = np.array(iou_thrs)
+    elif isinstance(iou_thrs, float):
+        _iou_thrs = np.array([iou_thrs])
+    else:
+        _iou_thrs = iou_thrs
+
+    return _proposal_nums, _iou_thrs
 def eval_recalls(gts,
                  proposals,
                  proposal_nums=None,
@@ -13612,15 +13835,13 @@ def eval_recalls(gts,
         _ious[k, :] = tmp_ious
 
     _ious = np.fliplr(np.sort(_ious, axis=1))
-    recalls = np.zeros((proposal_nums.size, thrs.size))
-    for i, thr in enumerate(thrs):
+    recalls = np.zeros((proposal_nums.size, iou_thrs.size))
+    for i, thr in enumerate(iou_thrs):
         recalls[:, i] = (_ious >= thr).sum(dim=1) / float(total_gt_num)
     proposal_nums = np.array(proposal_nums, dtype=np.int32)
     iou_thrs = np.array(iou_thrs)
-    if row_idxs is None:
-        row_idxs = np.arange(proposal_nums.size)
-    if col_idxs is None:
-        col_idxs = np.arange(iou_thrs.size)
+    row_idxs = np.arange(proposal_nums.size)
+    col_idxs = np.arange(iou_thrs.size)
     row_header = [''] + iou_thrs[col_idxs].tolist()
     table_data = [row_header]
     for i, num in enumerate(proposal_nums[row_idxs]):
@@ -14323,7 +14544,7 @@ class CocoMetric:
 
         if self._coco_api is None:
             # use converted gt json file to initialize coco api
-            print('Converting ground truth to coco format...')
+            print('Converting ground truth to coco format...',end = ' ')
             coco_json_path = self.gt_to_coco_json(
                 gt_dicts=gts, outfile_prefix=outfile_prefix)
             self._coco_api = COCO(coco_json_path)
@@ -14345,7 +14566,7 @@ class CocoMetric:
             return eval_results
 
         for metric in self.metrics:
-            print(f'Evaluating {metric}...')
+            print(f'Evaluating {metric}...',end=' ')
 
             # TODO: May refactor fast_eval_recall to an independent metric?
             # fast eval recall
@@ -15045,7 +15266,7 @@ ema = EMA(model = module)
 def train(epoch):
 #     print('in train')
     module.train()
-    optimizer.zero_grad()
+    
     if epoch < max_epochs - close_mosaic_epochs:
         data_stage = train_dataset
     else:
@@ -15054,29 +15275,35 @@ def train(epoch):
 #     print(epoch)
     for i in range(len(data_stage)):
         # assert jt.flags.use_cuda == 0
-        data_batch = data_stage[i]
+        data = data_stage[i]
         # assert jt.flags.use_cuda == 0
 #         print(data_batch['inputs'].shape)
         # print('should print')
         if i % 50 == 0:
             print(
-                f'Epoch(train): {epoch+1} step:{i}'
+                f'[{i+1}/{len(data_stage)}]',end=' '
             )
         # assert jt.flags.use_cuda == 0
-        data = module.data_preprocessor(data_batch)
+        # print('get data')
+        data = module.data_preprocessor(data)
+        # print('after preprocess')
         # assert jt.flags.use_cuda == 0
 #         print(data['inputs'].shape)
-        _data = yolov5_collate(data)
+        data = yolov5_collate(data)
+        # print('after collate')
         # assert jt.flags.use_cuda == 0
 #         print(_data['inputs'].shape)
 #         cls_logit, bbox_preds, bbox_dist_preds = module(_data['inputs'].mode='loss')
-        x = _data.pop('inputs')
+        # x = _data.pop('inputs')
         # print(f'data_batch:{data_batch}')
         # print(f'data:{data}')
         # print(f'_data:{_data}')
         # losses = module(_data['inputs'],_data,mode='loss')
         # assert jt.flags.use_cuda == 0
-        losses = module(x,_data,mode='loss')
+        # print('before forward')
+        # print(f'data:{data}')
+        # print(f'_data:{_data}')
+        losses = module(data['inputs'],data,mode='loss')
         loss_cls = losses['loss_cls']
         loss_bbox = losses['loss_bbox']
         loss_dfl = losses['loss_dfl']
@@ -15088,14 +15315,18 @@ def train(epoch):
         # loss_bbox = module.loss(bbox_preds[0], _data)
         # loss_dfl = module.loss(bbox_dist_preds, _data)
 
-        loss = loss_dfl + loss_bbox + loss_cls
+        loss = loss_dfl.sum() + loss_bbox.sum() + loss_cls.sum()
+        # print(f'loss :{loss}')
         # loss = losses['loss_cls'] + losses['loss_bbox'] + losses['loss_dfl']
 #         print(loss)
-#         assert isinstance(loss, jt.Var)
+        # assert isinstance(loss, jt.Var)
+        # loss = jt.array(loss)
+        # print(f'loss before backprop:{loss.data}')
         optim.step(loss=loss)
         print(
-                f'loss:{loss.numpy()} loss_cls:{loss_cls.numpy()} loss_bbox:{loss_bbox.numpy()} loss_dfl:{loss_dfl.numpy()}'
+                f'loss:{loss.data} loss_cls:{loss_cls.data} loss_bbox:{loss_bbox.sum().data} loss_dfl:{loss_dfl.data}'
             )
+        # print(f'before updata')
         ema.update_parameters(module)
 
 
@@ -15135,11 +15366,11 @@ def val(epoch):
         data_batch = val_dataset[i]
         if i % 50 == 0:
             print(
-                f'Epoch(Val): {epoch +1} step:{i}'
+                f'[{i+1}/{len(val_dataset)}]',end=' '
             )
         data = module.data_preprocessor(data_batch)
         _data = yolov5_collate(data)
-        
+        # result = module(_data['inputs'], _data, mode='predict')
         result = ema(_data['inputs'],_data,mode='predict')
         # val_loss = module.loss(_data, data_batch)
         val_evaluator.process(data_samples=result, data_batch=data_batch)
@@ -15166,9 +15397,16 @@ if __name__ == '__main__':
     # len(module)
     # len(train_dataset)
     # jt.flags.use_cuda = 0
+    # assert jt.flags.use_cuda == 0 and _device == 'cpu','due to the reason posed in readme.md, only cpu can be used'
     for epoch in range(max_epochs):
+        print(f'Epoch(train)[{epoch + 1}/{max_epochs}]',end = ' ')
+        start_time = time.time()
         train(epoch)
-        # val(epoch)
+        print(f'Epoch(val)[{epoch + 1}/{max_epochs}]', end=' ')
+        val(epoch)
+        train_epoch_time = time.time()
+        eta = str(datetime.timedelta(seconds = (train_epoch_time - start_time) * (max_epochs - epoch - 1)))
+        print(f'eta:{eta}')
 #         print('in')
 #         train(i + 1)
 #         print('out')
